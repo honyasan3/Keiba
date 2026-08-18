@@ -1,0 +1,37 @@
+# Python Bytecode & Cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual Environment
+.venv/
+env/
+venv/
+ENV/
+
+# Data & Cache (大容量データ・スクレイピングキャッシュ)
+data/
+data/cache/
+data/*.db
+data/*.sqlite3
+
+# Models (学習済みモデル)
+models_saved/
+
+# Logs
+logs/
+*.log
+
+# Sensitive Settings (Webhook URL等を含む設定ファイル)
+config/settings.yaml
+
+# IDE & Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS Generated files
+.DS_Store
+Thumbs.db
