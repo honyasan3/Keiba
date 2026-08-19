@@ -11,6 +11,9 @@ logger = setup_logger("schedule_scraper")
 class RaceScheduleScraper:
     """netkeibaの開催日程・レース一覧からレースIDを抽出するクラス"""
 
+    def __init__(self, config=None) -> None:
+        self.config = config
+
     @classmethod
     def get_race_ids_by_rounds(
         cls, date_str: Optional[str] = None, target_rounds: Optional[List[int]] = None
@@ -73,3 +76,11 @@ class RaceScheduleScraper:
 
         logger.info(f"対象レースID抽出完了: {len(race_list)} 件検出")
         return race_list
+
+    def fetch_daily_race_ids(self, target_date: str) -> List[str]:
+        """
+        指定日 (YYYY-MM-DD) の全JRAレースIDリストを返す互換メソッド
+        """
+        date_str = target_date.replace("-", "").strip() if target_date else None
+        race_dicts = self.get_race_ids_by_rounds(date_str=date_str, target_rounds=None)
+        return [item["race_id"] for item in race_dicts]
