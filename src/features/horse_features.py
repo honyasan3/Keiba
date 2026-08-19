@@ -310,5 +310,5 @@ class PastPerformanceExtractor(BaseFeatureExtractor):
         # ----------------------------------------------------
         df = self._calc_elo_ratings(df)
 
-        logger.info("ピュア走破能力＆Eloドメイン特徴量（全43特徴量）の生成が完了しました。")
+        logger.info("ピュア走破能力＆Eloドメイン特徴量（全46特徴量）の生成が完了しました。")
         return df
