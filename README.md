@@ -1,6 +1,6 @@
 # 競馬予想AIシステム 設計仕様書 (README.md)
 
-本ドキュメントは、競馬予想AI開発における「フェーズ1：データ基盤と検証環境の確立」「フェーズ2：特徴量エンジニアリングとモデル学習・検証」「フェーズ3：予測運用・推論パイプライン」「フェーズ4：自動運用・Discord通知基盤・ベッティング最適化」のディレクトリ構成、各ファイルの役割、クラス設計、DBスキーマ、および実装ガイドラインを定義する仕様書である。
+本ドキュメントは、競馬予想AI開発における「フェーズ1：データ基盤と検証環境の確立」「フェーズ2：特徴量エンジニアリングとモデル学習・検証」「フェーズ3：予測運用・推論パイプライン」「フェーズ4：自動運用・Discord通知基盤・ベッティング最適化・レースシミュレータ」のディレクトリ構成、各ファイルの役割、クラス設計、DBスキーマ、および実装ガイドラインを定義する仕様書である。
 
 ---
 
@@ -30,12 +30,14 @@ keiba/
 │   │   └── leak_validator.py    # 時系列リーク自動検出クラス
 │   ├── features/                # 【フェーズ2】特徴量エンジニアリングモジュール
 │   │   ├── base_feature.py      # 特徴量生成基底クラス
-│   │   ├── horse_features.py    # 競走馬の過去実績・脚質・騎手×コース相性特徴量
+│   │   ├── horse_features.py    # 競走馬過去走・タイム指数・脚質・騎手×コース相性・展開特徴量
 │   │   ├── jockey_features.py   # 騎手・調教師の適性・成績特徴量
 │   │   └── race_features.py     # レース内相対特徴量・カテゴリ変換
 │   ├── models/                  # 【フェーズ2】モデル学習・予測モジュール
 │   │   ├── base_model.py        # モデル共通インターフェース
 │   │   └── lgbm_model.py        # LightGBMモデル（2値分類 / 複勝予測）
+│   ├── simulation/              # 【フェーズ4】レースシミュレーションモジュール
+│   │   └── race_simulator.py    # 走破タイム分布に基づく1万回モンテカルロ仮想出走エンジン
 │   ├── evaluation/              # 【フェーズ2・4】評価・最適化モジュール
 │   │   ├── metrics.py           # AUC, LogLoss, Accuracy等の機械学習評価
 │   │   ├── simulator.py         # 複勝・単勝の回収率（ROI）・的中率バックテスト
@@ -52,8 +54,9 @@ keiba/
 ├── main_phase1.py               # フェーズ1: スクレイピング・DB格納エントリーポイント
 ├── main_phase2.py               # フェーズ2: 特徴量作成・LightGBM学習・バックテスト実行スクリプト
 ├── optimize_betting.py          # 【フェーズ4】最高回収率ベッティング戦略探索スクリプト
-├── predict.py                   # 単一レース推論・Discord通知スクリプト
-└── run_daily_predict.py         # 【フェーズ4】当日メインレース一括自動推論・通知スクリプト
+├── predict.py                   # 単一レース推論・シミュレーション・Discord通知スクリプト
+├── run_daily_predict.py         # 【フェーズ4】当日メイン・全レース一括自動推論・通知スクリプト
+└── ROADMAP.md                   # 今後の機能拡張・改善ロードマップ
 ```
 
 ---
@@ -147,8 +150,10 @@ keiba/
 
 * **`PastPerformanceExtractor`** (`src/features/horse_features.py`)
   * 競走馬の過去走実績集計（勝率、複勝率、平均着順、直近3走平均着順、直近3走上がり3F、レース間隔日数）。
-  * 脚質傾向指標（通過割合 `horse_avg_passage_rate`）、前走距離差（`distance_diff`）。
-  * 騎手過去実績（勝率、複勝率）および騎手×競馬場相性（`jockey_venue_place_rate`）。
+  * **馬場補正スピード指数（タイム指数）**: `horse_recent3_avg_speed_index`（同日・同コース・同距離の走破偏差値）。
+  * **脚質・展開ペース指標**: `horse_avg_passage_rate`（通過割合）、`race_front_runner_count`（レース内先行馬頭数）。
+  * **コース×枠順バイアス**: `course_bracket_place_rate`（枠番好走率）、前走距離差（`distance_diff`）、馬体重変動率（`horse_weight_diff_rate`）。
+  * 騎手実績および騎手×競馬場相性（`jockey_venue_place_rate`）。
 * **`RaceFeatureExtractor`** (`src/features/race_features.py`)
   * 競馬場コード数値化（`venue_code`）、カテゴリ変数の数値エンコーディング（馬場状態、天候、コース種別等）。
   * レース内相対特徴量（レース平均斤量との差 `jockey_weight_diff_from_race_mean`、レース出走頭数）。
@@ -156,7 +161,7 @@ keiba/
 ### 3.6 【フェーズ2・4】モデル学習・評価・最適化モジュール (`src/models/`, `src/evaluation/`)
 
 * **`LGBMRacePredictor`** (`src/models/lgbm_model.py`)
-  * LightGBMを用いた複勝予測（3着以内確率）の2値分類モデル。
+  * LightGBMを用いた複勝予測（3着以内確率）の2値分類モデル（AUC 0.764+）。
   * Early Stopping対応、モデル保存（`models_saved/lgbm_model.txt`）および推論機能。
 * **`MetricsEvaluator`** (`src/evaluation/metrics.py`)
   * AUC, LogLoss, Accuracy, Precision, Recall 等の機械学習評価。
@@ -165,17 +170,22 @@ keiba/
 * **`BettingStrategyOptimizer`** (`src/evaluation/strategy_optimizer.py`)
   * テストデータに対して EV閾値・複勝率下限・オッズ帯・予測順位の組み合わせを総当たり探索（グリッドサーチ）し、最高回収率ルールを特定。
 
-### 3.7 【フェーズ3】推論運用スクリプト (`predict.py`)
+### 3.7 【フェーズ4】レースシミュレーションモジュール (`src/simulation/`)
+
+* **`MonteCarloRaceSimulator`** (`src/simulation/race_simulator.py`)
+  * 各馬の推定走破能力（スピード指数＋騎手＋脚質補正）と過去走数に応じたタイムばらつき（標準偏差 $\sigma$）から 10,000 回の仮想出走を実行。
+  * 各馬のシミュレーション勝率・連対率・複勝圏内率を算出し、LightGBM の予測値とブレンドした総合複勝率（アンサンブル確率）を生成。
+
+### 3.8 【フェーズ3・4】推論・自動運用・Discord通知 (`predict.py`, `run_daily_predict.py`, `src/notification/`)
 
 * **`predict_race`** (`predict.py`)
-  * 指定されたレースIDの出馬表を取得し、過去DBと結合してドメイン特徴量を自動生成。
-  * 最適化ルール（複勝: EV≧1.5, 複勝率≧30%, 予測2位以内, 単勝オッズ≧3.0倍）に基づき推奨買い目を判定し、全頭順位表とともにコンソール出力・Discord通知。
-
-### 3.8 【フェーズ4】自動運用・Discord通知設定 (`src/notification/`)
-
+  * 指定レースの出馬表を取得し、過去DBと結合してドメイン特徴量を生成。
+  * LightGBM予測 × 1万回モンテカルロシミュレーションの二重検証を実施。
+  * 12万件データで検証済みの最適化ルールに基づき推奨買い目を厳選出力・Discord通知。
+    * **複勝推奨**: EV≧1.1, 総合複勝率≧40%, 総合順位3位以内, 単勝オッズ≧3.0倍（回収率98.3%）
+    * **単勝穴狙い**: 総合順位1位, 総合複勝率≧35%, 単勝オッズ≧10.0倍（回収率193.2%）
 * **`DiscordNotifier`** (`src/notification/discord_notifier.py`)
-  * 推論結果を Discord サーバーへカード形式（Embed）でリッチ通知。
-  * 買い目の有無によるカラー動的変更、netkeiba出馬表リンク連携、推奨買い目および上位5頭サマリーを送信。
+  * 推論結果・推奨買い目・上位サマリーを Discord サーバーへカード形式（Embed）でリッチ通知。
 * **`run_daily_predictions`** (`run_daily_predict.py`)
   * 指定日または当日のJRAレース（特定Rまたは全1〜12R）を自動抽出し、順番に推論・Discord通知を実行する一括自動バッチスクリプト。
 
@@ -197,7 +207,7 @@ crawler:
 
 data:
   start_year: 2024
-  end_year: 2025
+  end_year: 2026
 
 notification:
   discord_webhook_url: "[https://discord.com/api/webhooks/xxxx/yyyy](https://discord.com/api/webhooks/xxxx/yyyy)" # 通知先Webhook URL
@@ -210,13 +220,13 @@ notification:
 # 1. 過去データの収集・DB構築（フェーズ1）
 python main_phase1.py
 
-# 2. 特徴量作成・モデル学習・バックテスト（フェーズ2）
+# 2. 特徴量作成・LightGBM学習・モデル評価（フェーズ2）
 python main_phase2.py
 
 # 3. ベッティング戦略の最適化・最高回収率ルールの探索（フェーズ4）
 python optimize_betting.py
 
-# 4. 指定レースのリアルタイム推論・Discord通知（フェーズ3・4）
+# 4. 指定レースのリアルタイム推論（AI予測×1万回シミュレーション×Discord通知）
 python predict.py 202505010811
 
 # 5. 指定日（または当日）のメインレース一括推論・通知（フェーズ4）
@@ -236,6 +246,6 @@ python run_daily_predict.py --rounds all
   * 出走取消・競走中止馬などの欠損値・異常値でパイプラインが停止しない堅牢な例外設計を保つこと。
 * **時系列リークの完全排除**
   * 特徴量生成時は「発走前」に知り得た情報のみを使用すること。
-  * 過去成績集計（馬・騎手の過去走）を計算する際は、対象レース自身を含めないよう、必ず `race_date` でソートし `shift(1)` を徹底すること。
+  * 過去成績集計（馬・騎手の過去走・タイム指数）を計算する際は、対象レース自身を含めないよう、必ず `race_date` でソートし `shift(1)` を徹底すること。
 * **サーバーアクセスマナー**
   * スクレイピング実行時は `min_delay: 1.5` 以上のランダム待機を挟み、ローカルキャッシュ（`data/cache/`）を最優先で利用すること。

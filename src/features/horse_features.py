@@ -1,118 +1,160 @@
-"""競走馬・騎手・コース相性の過去実績特徴量抽出モジュール"""
-import re
-from typing import Any, List
+"""競走馬・騎手・ドメイン特徴量生成モジュール（タイム指数・展開ペース対応完全版）"""
 import numpy as np
 import pandas as pd
-from src.features.base_feature import BaseFeatureExtractor
 from src.common.logger import setup_logger
+from src.features.base_feature import BaseFeatureExtractor
 
 logger = setup_logger("horse_features")
 
 
 class PastPerformanceExtractor(BaseFeatureExtractor):
-    """過去走実績、脚質傾向、騎手×競馬場相性などの特徴量を抽出するクラス"""
+    """競走馬の過去走、タイム指数、騎手相性、展開ペース特徴量を算出するクラス"""
 
     def __init__(self, recent_runs: int = 3) -> None:
         self.recent_runs = recent_runs
 
-    def _calc_passage_rate(self, passage_str: Any, horse_count: int) -> float:
-        """通過順文字列（例: '1-1-2-2'）から最終コーナー付近の位置割合(0.0:先頭 ~ 1.0:最後方)を算出"""
-        if not isinstance(passage_str, str) or not passage_str or horse_count <= 1:
-            return np.nan
-        try:
-            parts = re.findall(r"\d+", passage_str)
-            if parts:
-                last_pos = int(parts[-1])
-                return round(last_pos / horse_count, 3)
-        except Exception:
-            pass
-        return np.nan
-
     def transform(self, df: pd.DataFrame) -> pd.DataFrame:
         logger.info("競走馬・騎手・ドメイン特徴量の生成を開始します。")
-        data = df.copy()
+        df = df.copy()
 
-        # 日付ソート（時系列整合性の保証）
-        data["race_date_dt"] = pd.to_datetime(data["race_date"])
-        data = data.sort_values(["race_date_dt", "race_id", "horse_num"]).reset_index(drop=True)
+        # 日付型変換と時系列ソート
+        df["race_date_dt"] = pd.to_datetime(df["race_date"])
+        df = df.sort_values(["race_date_dt", "race_id", "horse_num"]).reset_index(drop=True)
 
-        # レース内頭数
-        if "race_horse_count" not in data.columns:
-            data["race_horse_count"] = data.groupby("race_id")["horse_num"].transform("count")
+        # ターゲット変数（3着以内フラグ）
+        if "rank" in df.columns:
+            df["is_placed"] = (df["rank"] <= 3).astype(float)
+            df.loc[df["rank"].isna(), "is_placed"] = np.nan
+        else:
+            df["is_placed"] = np.nan
 
-        # 競馬場コード (数値型 int に変換)
-        data["venue_code"] = data["race_id"].astype(str).str[4:6].astype(int)
+        # ----------------------------------------------------
+        # 1. タイム指数の算出（同日・同コース・同距離の偏差値）
+        # ----------------------------------------------------
+        if "finish_time_sec" in df.columns:
+            group_keys = ["race_date", "course_type", "distance"]
+            race_mean_time = df.groupby(group_keys)["finish_time_sec"].transform("mean")
+            race_std_time = df.groupby(group_keys)["finish_time_sec"].transform("std").fillna(1.0)
+            
+            # タイム指数（平均より速いほどプラス値になるよう反転）
+            df["speed_index"] = -((df["finish_time_sec"] - race_mean_time) / race_std_time.clip(lower=0.5)) * 10 + 50
+        else:
+            df["speed_index"] = np.nan
 
-        # 1. 競走馬ごとの過去走集計
-        logger.info("競走馬の過去走および脚質特徴量を算出中...")
+        # ----------------------------------------------------
+        # 2. 通過順位から脚質（通過割合・1角位置）の算出
+        # ----------------------------------------------------
+        def _calc_passage_metrics(passage: str):
+            if not passage or pd.isna(passage):
+                return np.nan, np.nan
+            parts = str(passage).split("-")
+            try:
+                nums = [float(p) for p in parts if p.isdigit() or p.replace(".", "", 1).isdigit()]
+                if not nums:
+                    return np.nan, np.nan
+                first_corner = nums[0]
+                avg_pos = np.mean(nums)
+                return first_corner, avg_pos
+            except Exception:
+                return np.nan, np.nan
+
+        metrics = df["passage_order"].apply(_calc_passage_metrics)
+        df["first_corner_pos"] = [m[0] for m in metrics]
+        df["avg_passage_pos"] = [m[1] for m in metrics]
         
-        # 1着フラグ・3着以内フラグ・通過順割合の算出
-        data["is_win"] = (data["rank"] == 1).astype(float)
-        data["is_place"] = (data["rank"].between(1, 3)).astype(float)
-        data["passage_rate"] = [
-            self._calc_passage_rate(p, c) for p, c in zip(data["passage_order"], data["race_horse_count"])
-        ]
+        # レース出走頭数に対する通過割合（0に近いほど逃げ・先行、1に近いほど追込）
+        df["horse_avg_passage_rate"] = df["avg_passage_pos"] / df["race_horse_count"].clip(lower=1)
+        # 先行馬フラグ（1コーナー3番手以内）
+        df["is_front_runner"] = (df["first_corner_pos"] <= 3).astype(float)
 
-        horse_grouped = data.groupby("horse_id")
+        # ----------------------------------------------------
+        # 3. 競走馬ごとの過去走集計 (時系列リーク防止: shift(1))
+        # ----------------------------------------------------
+        logger.info("競走馬の過去走・タイム指数を算出中...")
+        grouped_horse = df.groupby("horse_id")
 
-        # 過去全走の累積集計 (shift(1)で未来リーク遮断)
-        data["horse_past_runs"] = horse_grouped.cumcount()
-        data["horse_past_wins"] = horse_grouped["is_win"].transform(lambda x: x.shift(1).cumsum()).fillna(0)
-        data["horse_past_places"] = horse_grouped["is_place"].transform(lambda x: x.shift(1).cumsum()).fillna(0)
-        data["horse_past_sum_rank"] = horse_grouped["rank"].transform(lambda x: x.shift(1).cumsum()).fillna(0)
-        data["horse_past_sum_passage"] = horse_grouped["passage_rate"].transform(lambda x: x.shift(1).cumsum()).fillna(0)
+        # 過去出走数
+        df["horse_past_runs"] = grouped_horse.cumcount()
 
-        # 過去平均値
-        data["horse_past_win_rate"] = np.where(data["horse_past_runs"] > 0, data["horse_past_wins"] / data["horse_past_runs"], 0.0)
-        data["horse_past_place_rate"] = np.where(data["horse_past_runs"] > 0, data["horse_past_places"] / data["horse_past_runs"], 0.0)
-        data["horse_past_avg_rank"] = np.where(data["horse_past_runs"] > 0, data["horse_past_sum_rank"] / data["horse_past_runs"], np.nan)
-        
-        # 脚質傾向: 過去平均通過割合
-        data["horse_avg_passage_rate"] = np.where(
-            data["horse_past_runs"] > 0, data["horse_past_sum_passage"] / data["horse_past_runs"], 0.5
+        # 過去平均着順・勝率・複勝率・脚質平均
+        past_rank_sum = grouped_horse["rank"].apply(lambda x: x.shift(1).cumsum()).reset_index(level=0, drop=True)
+        valid_rank_count = grouped_horse["rank"].apply(lambda x: (~x.shift(1).isna()).cumsum()).reset_index(level=0, drop=True)
+        df["horse_past_avg_rank"] = past_rank_sum / valid_rank_count.replace(0, np.nan)
+
+        past_placed_sum = grouped_horse["is_placed"].apply(lambda x: x.shift(1).cumsum()).reset_index(level=0, drop=True)
+        df["horse_past_place_rate"] = past_placed_sum / valid_rank_count.replace(0, np.nan)
+
+        past_win_sum = grouped_horse["rank"].apply(lambda x: (x.shift(1) == 1).astype(float).cumsum()).reset_index(level=0, drop=True)
+        df["horse_past_win_rate"] = past_win_sum / valid_rank_count.replace(0, np.nan)
+
+        # 過去平均通過割合
+        past_pass_sum = grouped_horse["horse_avg_passage_rate"].apply(lambda x: x.shift(1).cumsum()).reset_index(level=0, drop=True)
+        valid_pass_count = grouped_horse["horse_avg_passage_rate"].apply(lambda x: (~x.shift(1).isna()).cumsum()).reset_index(level=0, drop=True)
+        df["horse_avg_passage_rate"] = past_pass_sum / valid_pass_count.replace(0, np.nan)
+
+        # 直近3走の平均着順・上がり3F・タイム指数
+        df["horse_recent3_avg_rank"] = (
+            grouped_horse["rank"]
+            .apply(lambda x: x.shift(1).rolling(self.recent_runs, min_periods=1).mean())
+            .reset_index(level=0, drop=True)
+        )
+        df["horse_recent3_avg_last3f"] = (
+            grouped_horse["last_3f_time"]
+            .apply(lambda x: x.shift(1).rolling(self.recent_runs, min_periods=1).mean())
+            .reset_index(level=0, drop=True)
+        )
+        df["horse_recent3_avg_speed_index"] = (
+            grouped_horse["speed_index"]
+            .apply(lambda x: x.shift(1).rolling(self.recent_runs, min_periods=1).mean())
+            .reset_index(level=0, drop=True)
         )
 
-        # 距離変化（前走との距離差: 延長>0, 短縮<0）
-        data["prev_distance"] = horse_grouped["distance"].shift(1)
-        data["distance_diff"] = (data["distance"] - data["prev_distance"]).fillna(0)
+        # レース間隔日数
+        df["prev_race_date"] = grouped_horse["race_date_dt"].shift(1)
+        df["days_since_prev_race"] = (df["race_date_dt"] - df["prev_race_date"]).dt.days
 
-        # 直近N走集計
-        data["horse_recent3_avg_rank"] = (
-            horse_grouped["rank"]
-            .transform(lambda x: x.shift(1).rolling(self.recent_runs, min_periods=1).mean())
-        )
-        data["horse_recent3_avg_last3f"] = (
-            horse_grouped["last_3f_time"]
-            .transform(lambda x: x.shift(1).rolling(self.recent_runs, min_periods=1).mean())
-        )
+        # 距離変化
+        df["prev_distance"] = grouped_horse["distance"].shift(1)
+        df["distance_diff"] = df["distance"] - df["prev_distance"]
 
-        # 前走からの経過日数 (レース間隔)
-        prev_date = horse_grouped["race_date_dt"].shift(1)
-        data["days_since_prev_race"] = (data["race_date_dt"] - prev_date).dt.days.fillna(999)
+        # 体重増減率（%）
+        if "horse_weight" in df.columns and "horse_weight_diff" in df.columns:
+            df["horse_weight_diff_rate"] = (df["horse_weight_diff"] / df["horse_weight"].replace(0, np.nan)) * 100
+        else:
+            df["horse_weight_diff_rate"] = np.nan
 
-        # 2. 騎手の過去実績集計
-        logger.info("騎手実績およびコース相性特徴量を算出中...")
-        jockey_grouped = data.groupby("jockey_name")
-        data["jockey_past_rides"] = jockey_grouped.cumcount()
-        data["jockey_past_wins"] = jockey_grouped["is_win"].transform(lambda x: x.shift(1).cumsum()).fillna(0)
-        data["jockey_past_places"] = jockey_grouped["is_place"].transform(lambda x: x.shift(1).cumsum()).fillna(0)
+        # ----------------------------------------------------
+        # 4. 騎手実績およびコース・枠相性
+        # ----------------------------------------------------
+        logger.info("騎手実績およびコース・枠順バイアスを算出中...")
+        grouped_jockey = df.groupby("jockey_name")
 
-        data["jockey_past_win_rate"] = np.where(data["jockey_past_rides"] > 0, data["jockey_past_wins"] / data["jockey_past_rides"], 0.0)
-        data["jockey_past_place_rate"] = np.where(data["jockey_past_rides"] > 0, data["jockey_past_places"] / data["jockey_past_rides"], 0.0)
+        jockey_valid_runs = grouped_jockey["rank"].apply(lambda x: (~x.shift(1).isna()).cumsum()).reset_index(level=0, drop=True)
+        jockey_placed_sum = grouped_jockey["is_placed"].apply(lambda x: x.shift(1).cumsum()).reset_index(level=0, drop=True)
+        df["jockey_past_place_rate"] = jockey_placed_sum / jockey_valid_runs.replace(0, np.nan)
 
-        # 騎手 × 競馬場の過去複勝率
-        jv_grouped = data.groupby(["jockey_name", "venue_code"])
-        data["jv_past_rides"] = jv_grouped.cumcount()
-        data["jv_past_places"] = jv_grouped["is_place"].transform(lambda x: x.shift(1).cumsum()).fillna(0)
-        data["jockey_venue_place_rate"] = np.where(data["jv_past_rides"] > 0, data["jv_past_places"] / data["jv_past_rides"], data["jockey_past_place_rate"])
+        jockey_win_sum = grouped_jockey["rank"].apply(lambda x: (x.shift(1) == 1).astype(float).cumsum()).reset_index(level=0, drop=True)
+        df["jockey_past_win_rate"] = jockey_win_sum / jockey_valid_runs.replace(0, np.nan)
 
-        # 不要な中間列を削除
-        drop_cols = [
-            "race_date_dt", "is_win", "is_place", "passage_rate", "prev_distance",
-            "horse_past_wins", "horse_past_places", "horse_past_sum_rank", "horse_past_sum_passage",
-            "jockey_past_rides", "jockey_past_wins", "jockey_past_places", "jv_past_rides", "jv_past_places"
-        ]
-        data = data.drop(columns=drop_cols, errors="ignore")
+        # 騎手 × 競馬場相性
+        df["jockey_venue"] = df["jockey_name"] + "_" + df["race_id"].str[4:6]
+        grouped_jv = df.groupby("jockey_venue")
+        jv_valid_runs = grouped_jv["rank"].apply(lambda x: (~x.shift(1).isna()).cumsum()).reset_index(level=0, drop=True)
+        jv_placed_sum = grouped_jv["is_placed"].apply(lambda x: x.shift(1).cumsum()).reset_index(level=0, drop=True)
+        df["jockey_venue_place_rate"] = jv_placed_sum / jv_valid_runs.replace(0, np.nan)
 
-        logger.info("競走馬・騎手・ドメイン特徴量の生成が完了しました。")
-        return data
+        # コース種別 × 枠番の好走率（枠順バイアス）
+        df["course_bracket"] = df["course_type"] + "_" + df["bracket_num"].astype(str)
+        grouped_cb = df.groupby("course_bracket")
+        cb_valid_runs = grouped_cb["rank"].apply(lambda x: (~x.shift(1).isna()).cumsum()).reset_index(level=0, drop=True)
+        cb_placed_sum = grouped_cb["is_placed"].apply(lambda x: x.shift(1).cumsum()).reset_index(level=0, drop=True)
+        df["course_bracket_place_rate"] = cb_placed_sum / cb_valid_runs.replace(0, np.nan)
+
+        # ----------------------------------------------------
+        # 5. レース展開（先行馬頭数）
+        # ----------------------------------------------------
+        # 前走先行していた馬が対象レース内に何頭いるか
+        df["race_front_runner_count"] = df.groupby("race_id")["is_front_runner"].transform("sum")
+
+        logger.info("高度特徴量の生成が完了しました。")
+        return df

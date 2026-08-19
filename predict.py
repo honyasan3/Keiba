@@ -1,4 +1,4 @@
-"""リアルタイムレース予想・推論スクリプト（単勝・複勝・Discord通知対応版）"""
+"""リアルタイムレース予想・推論スクリプト（LightGBM × モンテカルロシミュレータ統合版）"""
 import argparse
 import re
 import pandas as pd
@@ -15,11 +15,13 @@ from src.models.lgbm_model import LGBMRacePredictor
 from src.notification.discord_notifier import DiscordNotifier
 from src.pipeline.cleaner import DataCleaner
 from src.pipeline.repository import RaceModel, RaceResultModel
+from src.simulation.race_simulator import MonteCarloRaceSimulator
 
 logger = setup_logger("predict")
 
 
 def get_historical_data(db_connector: DatabaseConnector) -> pd.DataFrame:
+    """DBから過去のレース実績データを抽出"""
     with db_connector.get_session() as session:
         query = (
             session.query(
@@ -123,8 +125,11 @@ def predict_race(
         return
 
     hist_df = get_historical_data(db_connector)
+    # DB内に既に存在する同じrace_idのレコードを過去データ側から除外して重複を防ぐ
+    hist_df = hist_df[hist_df["race_id"] != race_id].copy()
     combined_df = pd.concat([hist_df, target_df], ignore_index=True)
 
+    # 特徴量抽出
     race_fe = RaceFeatureExtractor()
     horse_fe = PastPerformanceExtractor(recent_runs=3)
 
@@ -140,68 +145,86 @@ def predict_race(
         "venue_code", "race_round", "distance", "course_type_cat", "weather_cat",
         "track_condition_cat", "bracket_num", "horse_num", "gender_cat", "age",
         "jockey_weight", "jockey_weight_diff_from_race_mean", "race_horse_count",
-        "horse_weight", "horse_weight_diff", "horse_past_runs", "horse_past_avg_rank",
-        "horse_past_win_rate", "horse_past_place_rate", "horse_avg_passage_rate",
-        "distance_diff", "horse_recent3_avg_rank", "horse_recent3_avg_last3f",
-        "days_since_prev_race", "jockey_past_win_rate", "jockey_past_place_rate",
-        "jockey_venue_place_rate"
+        "horse_weight", "horse_weight_diff", "horse_weight_diff_rate",
+        "horse_past_runs", "horse_past_avg_rank", "horse_past_win_rate", "horse_past_place_rate",
+        "horse_avg_passage_rate", "distance_diff", "horse_recent3_avg_rank",
+        "horse_recent3_avg_last3f", "horse_recent3_avg_speed_index", "days_since_prev_race",
+        "jockey_past_win_rate", "jockey_past_place_rate", "jockey_venue_place_rate",
+        "course_bracket_place_rate", "race_front_runner_count"
     ]
 
+    # 1. LightGBMによる複勝確率予測
     infer_df["pred_place_prob"] = predictor.predict_proba(infer_df[feature_cols])
-    infer_df["place_odds_est"] = (infer_df["odds"].fillna(1.0) ** 0.45).clip(lower=1.1)
-    infer_df["ev_place"] = infer_df["pred_place_prob"] * infer_df["place_odds_est"]
 
-    result_df = infer_df.sort_values("pred_place_prob", ascending=False).reset_index(drop=True)
+    # 2. モンテカルロシミュレーション実行（1万回試行）
+    simulator = MonteCarloRaceSimulator(n_simulations=10000)
+    infer_df = simulator.simulate_race(infer_df)
+
+    # 3. 期待値（EV）計算
+    infer_df["place_odds_est"] = (infer_df["odds"].fillna(1.0) ** 0.45).clip(lower=1.1)
+    infer_df["ev_place"] = infer_df["ensemble_place_prob"] * infer_df["place_odds_est"]
+
+    # 総合複勝率でソート
+    result_df = infer_df.sort_values("ensemble_place_prob", ascending=False).reset_index(drop=True)
     result_df["pred_rank"] = result_df.index + 1
 
     # 1. 全頭一覧テーブル表示
-    print(f"\n=======================================================")
+    print("\n" + "=" * 70)
     print(f" レース予想: {raw_card.get('race_title', '')} (ID: {race_id})")
     print(f" 条件: {raw_card.get('course_type')} {raw_card.get('distance')}m 天候:{raw_card.get('weather')} 馬場:{raw_card.get('track_condition')}")
-    print(f"=======================================================\n")
+    print("=" * 70 + "\n")
 
-    display_cols = ["pred_rank", "horse_num", "bracket_num", "horse_name", "jockey_name", "odds", "place_odds_est", "pred_place_prob", "ev_place"]
+    display_cols = [
+        "pred_rank", "horse_num", "bracket_num", "horse_name", "jockey_name",
+        "odds", "place_odds_est", "pred_place_prob", "sim_win_prob", "ensemble_place_prob", "ev_place"
+    ]
     table_view = result_df[display_cols].copy()
     table_view["pred_place_prob"] = (table_view["pred_place_prob"] * 100).round(1).astype(str) + "%"
+    table_view["sim_win_prob"] = (table_view["sim_win_prob"] * 100).round(1).astype(str) + "%"
+    table_view["ensemble_place_prob"] = (table_view["ensemble_place_prob"] * 100).round(1).astype(str) + "%"
     table_view["place_odds_est"] = table_view["place_odds_est"].round(1)
     table_view["ev_place"] = table_view["ev_place"].round(2)
-    table_view.columns = ["予想順位", "馬番", "枠", "馬名", "騎手", "単勝オッズ", "推定複勝", "予測複勝率", "複勝EV"]
+    table_view.columns = ["総合順位", "馬番", "枠", "馬名", "騎手", "単勝オッズ", "推定複勝", "AI複勝率", "シミュ勝率", "総合複勝率", "複勝EV"]
 
     print(tabulate(table_view, headers="keys", tablefmt="fancy_grid", showindex=False))
 
-    # 2. 買い目判定（最適化された回収率121%ルール）
-    # 複勝: EV >= 1.5, 複勝率 >= 30%, 予測2位以内, 単勝オッズ >= 3.0倍
+    # 2. 買い目判定（12万件データ検証済みの最新最適化ルール）
+    
+    # 🟢 複勝推奨: EV >= 1.1, 総合複勝率 >= 40%, 総合順位 3位以内, 単勝オッズ >= 3.0倍（回収率98.3%ルール）
     place_rec = result_df[
-        (result_df["ev_place"] >= 1.5)
-        & (result_df["pred_place_prob"] >= 0.30)
-        & (result_df["pred_rank"] <= 2)
+        (result_df["ev_place"] >= 1.1)
+        & (result_df["ensemble_place_prob"] >= 0.40)
+        & (result_df["pred_rank"] <= 3)
         & (result_df["odds"] >= 3.0)
     ]
 
-    # 単勝狙い目: 予測1位かつ複勝率40%以上かつ単勝3〜20倍（参考枠）
+    # 🟠 単勝穴狙い: 総合順位 1位, 総合複勝率 >= 35%, 単勝オッズ 10.0倍以上（高配当特化・回収率193.2%ルール）
     win_candidate = result_df[
         (result_df["pred_rank"] == 1)
-        & (result_df["pred_place_prob"] >= 0.40)
-        & (result_df["odds"] >= 3.0)
-        & (result_df["odds"] <= 20.0)
+        & (result_df["ensemble_place_prob"] >= 0.35)
+        & (result_df["odds"] >= 10.0)
     ]
 
     # コンソール側への買い目出力
-    print("\n" + "=" * 55)
-    print(" 🎯 【AI厳選推奨買い目判定】")
-    print("=" * 55)
+    print("\n" + "=" * 60)
+    print(" 🎯 【AI × シミュレーション 厳選推奨買い目判定】")
+    print("=" * 60)
     if not place_rec.empty:
         for _, row in place_rec.iterrows():
-            print(f" 🟢 複勝推奨: [{row['horse_num']}番] {row['horse_name']} "
-                  f"(複勝率: {row['pred_place_prob']*100:.1f}%, 想定: {row['place_odds_est']:.1f}倍, EV: {row['ev_place']:.2f})")
+            print(
+                f" 🟢 複勝推奨: [{row['horse_num']}番] {row['horse_name']} "
+                f"(総合複勝率: {row['ensemble_place_prob']*100:.1f}%, 想定複勝: {row['place_odds_est']:.1f}倍, EV: {row['ev_place']:.2f})"
+            )
     else:
-        print(" ⏸️ 複勝: 基準（EV≧1.5, 複勝率≧30%, 予測2位以内）を満たす馬がいないため【見送り (KEN)】")
+        print(" ⏸️ 複勝: 基準（EV≧1.1, 総合複勝率≧40%, 順位3位以内, 単勝3倍以上）を満たす馬がいないため【見送り (KEN)】")
 
     if not win_candidate.empty:
         for _, row in win_candidate.iterrows():
-            print(f" 🟠 単勝狙い: [{row['horse_num']}番] {row['horse_name']} "
-                  f"(単勝オッズ: {row['odds']:.1f}倍, 複勝圏内率: {row['pred_place_prob']*100:.1f}%)")
-    print("=" * 55 + "\n")
+            print(
+                f" 🟠 単勝穴狙い: [{row['horse_num']}番] {row['horse_name']} "
+                f"(単勝オッズ: {row['odds']:.1f}倍, シミュ勝率: {row['sim_win_prob']*100:.1f}%, 総合複勝率: {row['ensemble_place_prob']*100:.1f}%)"
+            )
+    print("=" * 60 + "\n")
 
     # 3. Discord通知
     if notify:
