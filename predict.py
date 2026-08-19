@@ -153,30 +153,26 @@ def predict_race(
         "course_bracket_place_rate", "race_front_runner_count"
     ]
 
-    # 1. LightGBMによる複勝確率予測
+# 1. LightGBMによる複勝確率予測
     infer_df["pred_place_prob"] = predictor.predict_proba(infer_df[feature_cols])
 
-    # 2. モンテカルロシミュレーション実行（1万回試行）
+    # 2. モンテカルロシミュレーション（ワイド・馬連・ケリー対応）
     simulator = MonteCarloRaceSimulator(n_simulations=10000)
-    infer_df = simulator.simulate_race(infer_df)
-
-    # 3. 期待値（EV）計算
-    infer_df["place_odds_est"] = (infer_df["odds"].fillna(1.0) ** 0.45).clip(lower=1.1)
-    infer_df["ev_place"] = infer_df["ensemble_place_prob"] * infer_df["place_odds_est"]
+    result_df, wide_df, umaren_df = simulator.simulate_race(infer_df, bankroll=10000)
 
     # 総合複勝率でソート
-    result_df = infer_df.sort_values("ensemble_place_prob", ascending=False).reset_index(drop=True)
+    result_df = result_df.sort_values("ensemble_place_prob", ascending=False).reset_index(drop=True)
     result_df["pred_rank"] = result_df.index + 1
 
-    # 1. 全頭一覧テーブル表示
-    print("\n" + "=" * 70)
+    # 全頭一覧テーブル表示
+    print("\n" + "=" * 75)
     print(f" レース予想: {raw_card.get('race_title', '')} (ID: {race_id})")
     print(f" 条件: {raw_card.get('course_type')} {raw_card.get('distance')}m 天候:{raw_card.get('weather')} 馬場:{raw_card.get('track_condition')}")
-    print("=" * 70 + "\n")
+    print("=" * 75 + "\n")
 
     display_cols = [
         "pred_rank", "horse_num", "bracket_num", "horse_name", "jockey_name",
-        "odds", "place_odds_est", "pred_place_prob", "sim_win_prob", "ensemble_place_prob", "ev_place"
+        "odds", "place_odds_est", "pred_place_prob", "sim_win_prob", "ensemble_place_prob", "ev_place", "kelly_bet_place"
     ]
     table_view = result_df[display_cols].copy()
     table_view["pred_place_prob"] = (table_view["pred_place_prob"] * 100).round(1).astype(str) + "%"
@@ -184,13 +180,12 @@ def predict_race(
     table_view["ensemble_place_prob"] = (table_view["ensemble_place_prob"] * 100).round(1).astype(str) + "%"
     table_view["place_odds_est"] = table_view["place_odds_est"].round(1)
     table_view["ev_place"] = table_view["ev_place"].round(2)
-    table_view.columns = ["総合順位", "馬番", "枠", "馬名", "騎手", "単勝オッズ", "推定複勝", "AI複勝率", "シミュ勝率", "総合複勝率", "複勝EV"]
+    table_view["kelly_bet_place"] = table_view["kelly_bet_place"].astype(str) + "円"
+    table_view.columns = ["総合順位", "馬番", "枠", "馬名", "騎手", "単勝オッズ", "推定複勝", "AI複勝率", "シミュ勝率", "総合複勝率", "複勝EV", "ケリー推奨額"]
 
     print(tabulate(table_view, headers="keys", tablefmt="fancy_grid", showindex=False))
 
-    # 2. 買い目判定（12万件データ検証済みの最新最適化ルール）
-    
-    # 🟢 複勝推奨: EV >= 1.1, 総合複勝率 >= 40%, 総合順位 3位以内, 単勝オッズ >= 3.0倍（回収率98.3%ルール）
+    # 買い目判定
     place_rec = result_df[
         (result_df["ev_place"] >= 1.1)
         & (result_df["ensemble_place_prob"] >= 0.40)
@@ -198,45 +193,56 @@ def predict_race(
         & (result_df["odds"] >= 3.0)
     ]
 
-    # 🟠 単勝穴狙い: 総合順位 1位, 総合複勝率 >= 35%, 単勝オッズ 10.0倍以上（高配当特化・回収率193.2%ルール）
     win_candidate = result_df[
         (result_df["pred_rank"] == 1)
         & (result_df["ensemble_place_prob"] >= 0.35)
         & (result_df["odds"] >= 10.0)
     ]
 
-    # コンソール側への買い目出力
-    print("\n" + "=" * 60)
-    print(" 🎯 【AI × シミュレーション 厳選推奨買い目判定】")
-    print("=" * 60)
+    # ワイド推奨 (EV >= 1.25 かつ 確率 >= 15%)
+    wide_rec = wide_df[(wide_df["ev"] >= 1.25) & (wide_df["prob"] >= 0.15)].head(3) if not wide_df.empty else pd.DataFrame()
+
+    print("\n" + "=" * 65)
+    print(" 🎯 【AI × シミュレーション 厳選推奨買い目（資金傾斜付き）】")
+    print("=" * 65)
     if not place_rec.empty:
         for _, row in place_rec.iterrows():
             print(
                 f" 🟢 複勝推奨: [{row['horse_num']}番] {row['horse_name']} "
-                f"(総合複勝率: {row['ensemble_place_prob']*100:.1f}%, 想定複勝: {row['place_odds_est']:.1f}倍, EV: {row['ev_place']:.2f})"
+                f"(総合複勝率: {row['ensemble_place_prob']*100:.1f}%, 想定: {row['place_odds_est']:.1f}倍, EV: {row['ev_place']:.2f}) "
+                f"👉 推奨賭け金: 【{row['kelly_bet_place']}円】"
             )
     else:
-        print(" ⏸️ 複勝: 基準（EV≧1.1, 総合複勝率≧40%, 順位3位以内, 単勝3倍以上）を満たす馬がいないため【見送り (KEN)】")
+        print(" ⏸️ 複勝: 基準を満たす馬がいないため【見送り (KEN)】")
 
     if not win_candidate.empty:
         for _, row in win_candidate.iterrows():
             print(
                 f" 🟠 単勝穴狙い: [{row['horse_num']}番] {row['horse_name']} "
-                f"(単勝オッズ: {row['odds']:.1f}倍, シミュ勝率: {row['sim_win_prob']*100:.1f}%, 総合複勝率: {row['ensemble_place_prob']*100:.1f}%)"
+                f"(単勝: {row['odds']:.1f}倍, シミュ勝率: {row['sim_win_prob']*100:.1f}%, 総合複勝率: {row['ensemble_place_prob']*100:.1f}%)"
             )
-    print("=" * 60 + "\n")
 
+    if not wide_rec.empty:
+        print("-" * 65)
+        for _, row in wide_rec.iterrows():
+            print(
+                f" 🔵 ワイド推奨: [{row['pair']}] {row['names']} "
+                f"(的中率: {row['prob']*100:.1f}%, 想定: {row['est_odds']}倍, EV: {row['ev']:.2f})"
+            )
+    print("=" * 65 + "\n")
+    
     # 3. Discord通知
     if notify:
-        notif_cfg = getattr(config, "notification", None)
-        if notif_cfg and getattr(notif_cfg, "enabled", False):
-            notifier = DiscordNotifier(webhook_url=notif_cfg.discord_webhook_url, enabled=True)
-            notifier.send_prediction_report(
-                race_info=raw_card,
-                top_entries=result_df.to_dict(orient="records"),
-                place_recommendations=place_rec.to_dict(orient="records"),
-                win_recommendations=win_candidate.to_dict(orient="records"),
-            )
+            notif_cfg = getattr(config, "notification", None)
+            if notif_cfg and getattr(notif_cfg, "enabled", False):
+                notifier = DiscordNotifier(webhook_url=notif_cfg.discord_webhook_url, enabled=True)
+                notifier.send_prediction_report(
+                    race_info=raw_card,
+                    top_entries=result_df.to_dict(orient="records"),
+                    place_recommendations=place_rec.to_dict(orient="records"),
+                    win_recommendations=win_candidate.to_dict(orient="records"),
+                    wide_recommendations=wide_rec.to_dict(orient="records") if not wide_rec.empty else [],
+                )
 
 
 if __name__ == "__main__":
