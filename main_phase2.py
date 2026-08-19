@@ -1,4 +1,5 @@
-"""フェーズ2: 特徴量エンジニアリング、モデル学習、バックテスト実行パイプライン"""
+"""フェーズ2: 特徴量エンジニアリング、アンサンブルモデル学習 (LightGBM × CatBoost)、バックテスト実行パイプライン"""
+import os
 import pandas as pd
 from config.config_loader import ConfigLoader
 from src.common.db import DatabaseConnector
@@ -9,6 +10,7 @@ from src.evaluation.metrics import MetricsEvaluator
 from src.evaluation.simulator import BettingSimulator
 from src.features.horse_features import PastPerformanceExtractor
 from src.features.race_features import RaceFeatureExtractor
+from src.models.catboost_model import CatBoostRacePredictor
 from src.models.lgbm_model import LGBMRacePredictor
 from src.pipeline.repository import RaceModel, RaceResultModel
 
@@ -74,19 +76,23 @@ def run_pipeline() -> None:
         lambda r: 1 if pd.notnull(r) and r == 1 else 0
     )
 
-    # 特徴量リスト
+    # カテゴリ特徴量 & 全特徴量リスト
+    cat_cols = [
+        "venue_code", "course_type_cat", "weather_cat", "track_condition_cat",
+        "gender_cat", "age_gender_cat", "rest_category_cat", "distance_shock_cat"
+    ]
     feature_cols = [
-            "venue_code", "race_round", "distance", "course_type_cat", "weather_cat",
-            "track_condition_cat", "bracket_num", "horse_num", "gender_cat", "age", "age_gender_cat",
-            "jockey_weight", "jockey_weight_diff_from_race_mean", "race_horse_count",
-            "horse_weight", "horse_weight_diff", "horse_weight_diff_rate",
-            "horse_past_runs", "horse_past_avg_rank", "horse_past_win_rate", "horse_past_place_rate",
-            "horse_avg_passage_rate", "distance_diff", "distance_shock_cat", "horse_recent3_avg_rank",
-            "horse_recent3_avg_last3f", "horse_recent3_avg_speed_index", "days_since_prev_race",
-            "rest_category_cat", "is_second_run_after_rest", "is_jockey_changed",
-            "jockey_past_win_rate", "jockey_past_place_rate", "jockey_venue_place_rate",
-            "course_bracket_place_rate", "race_front_runner_count"
-        ]
+        "venue_code", "race_round", "distance", "course_type_cat", "weather_cat",
+        "track_condition_cat", "bracket_num", "horse_num", "gender_cat", "age", "age_gender_cat",
+        "jockey_weight", "jockey_weight_diff_from_race_mean", "race_horse_count",
+        "horse_weight", "horse_weight_diff", "horse_weight_diff_rate",
+        "horse_past_runs", "horse_past_avg_rank", "horse_past_win_rate", "horse_past_place_rate",
+        "horse_avg_passage_rate", "distance_diff", "distance_shock_cat", "horse_recent3_avg_rank",
+        "horse_recent3_avg_last3f", "horse_recent3_avg_speed_index", "days_since_prev_race",
+        "rest_category_cat", "is_second_run_after_rest", "is_jockey_changed",
+        "jockey_past_win_rate", "jockey_past_place_rate", "jockey_venue_place_rate",
+        "course_bracket_place_rate", "race_front_runner_count"
+    ]
 
     # リーク検証
     if not DataLeakageValidator.validate_features(feature_cols):
@@ -106,16 +112,19 @@ def run_pipeline() -> None:
         df_featured, train_end=train_end, val_end=val_end
     )
 
-    # 4. LightGBM学習（複勝モデル target_place を学習）
-    logger.info("--- 複勝予測モデル (3着以内) の学習を開始 ---")
-    predictor = LGBMRacePredictor()
-
     X_train = train_df[feature_cols]
     y_train = train_df["target_place"]
     X_val = val_df[feature_cols]
     y_val = val_df["target_place"]
+    X_test = test_df[feature_cols]
+    y_test = test_df["target_place"]
 
-    predictor.train(
+    os.makedirs("models_saved", exist_ok=True)
+
+    # 4. LightGBM学習（複勝モデル target_place を学習）
+    logger.info("--- [1/2] LightGBM モデルの学習を開始 ---")
+    lgbm_predictor = LGBMRacePredictor()
+    lgbm_predictor.train(
         X_train=X_train,
         y_train=y_train,
         X_val=X_val,
@@ -123,22 +132,42 @@ def run_pipeline() -> None:
         early_stopping_rounds=30,
     )
 
-    importance_df = predictor.get_feature_importance()
-    logger.info(f"【特徴量重要度 Top 10】\n{importance_df.head(10)}")
+    importance_df = lgbm_predictor.get_feature_importance()
+    logger.info(f"【LightGBM 特徴量重要度 Top 10】\n{importance_df.head(10)}")
+    lgbm_predictor.save("models_saved/lgbm_model.txt")
 
-    predictor.save("models_saved/lgbm_model.txt")
+    lgbm_test_preds = lgbm_predictor.predict_proba(X_test)
+    lgbm_metrics = MetricsEvaluator.calculate_all_metrics(y_test, lgbm_test_preds)
+    logger.info(f"LightGBM 単体評価 - AUC: {lgbm_metrics['auc']}, LogLoss: {lgbm_metrics['logloss']}")
 
-    # 5. 推論とバックテスト
-    test_df = test_df.copy()
-    test_df["pred_prob"] = predictor.predict_proba(test_df[feature_cols])
-
-    # 評価指標算出
-    metrics = MetricsEvaluator.calculate_all_metrics(
-        test_df["target_place"], test_df["pred_prob"]
+    # 5. CatBoost学習
+    logger.info("--- [2/2] CatBoost モデルの学習を開始 ---")
+    cb_predictor = CatBoostRacePredictor(cat_features=cat_cols)
+    cb_predictor.train(
+        X_train=X_train,
+        y_train=y_train,
+        X_val=X_val,
+        y_val=y_val,
+        early_stopping_rounds=30,
     )
+    cb_predictor.save("models_saved/catboost_model.cbm")
+
+    cb_test_preds = cb_predictor.predict_proba(X_test)
+    cb_metrics = MetricsEvaluator.calculate_all_metrics(y_test, cb_test_preds)
+    logger.info(f"CatBoost 単体評価 - AUC: {cb_metrics['auc']}, LogLoss: {cb_metrics['logloss']}")
+
+    # 6. アンサンブル推論 (LightGBM 50% + CatBoost 50%)
+    logger.info("--- [3/3] アンサンブル (LightGBM × CatBoost) 評価 ---")
+    ensemble_preds = (lgbm_test_preds * 0.5) + (cb_test_preds * 0.5)
+
+    ensemble_metrics = MetricsEvaluator.calculate_all_metrics(y_test, ensemble_preds)
     logger.info(
-        f"モデル評価指標 - AUC: {metrics['auc']}, LogLoss: {metrics['logloss']}, Accuracy: {metrics['accuracy']}"
+        f"★ アンサンブル総合評価 - AUC: {ensemble_metrics['auc']}, LogLoss: {ensemble_metrics['logloss']}, Accuracy: {ensemble_metrics['accuracy']}"
     )
+
+    # 7. バックテスト（アンサンブル確率で実行）
+    test_df = test_df.copy()
+    test_df["pred_prob"] = ensemble_preds
 
     # 複勝シミュレーション
     BettingSimulator.simulate_place_bet(
@@ -149,7 +178,7 @@ def run_pipeline() -> None:
         max_rank_in_race=3,
     )
 
-    # 単勝シミュレーションも参考比較
+    # 単勝シミュレーション
     BettingSimulator.simulate_single_bet(
         test_df,
         pred_col="pred_prob",
