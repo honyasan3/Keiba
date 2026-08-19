@@ -73,6 +73,7 @@ def run_backtest() -> None:
 
     logger.info(f"バックテスト対象期間: {test_df['race_date'].min()} 〜 {test_df['race_date'].max()} ({len(test_df)} 件)")
 
+    # 41特徴量リスト
     feature_cols = [
         "venue_code", "race_round", "distance", "course_type_cat", "weather_cat",
         "track_condition_cat", "bracket_num", "horse_num", "gender_cat", "age", "age_gender_cat",
@@ -83,7 +84,10 @@ def run_backtest() -> None:
         "horse_recent3_avg_last3f", "horse_recent3_avg_speed_index", "days_since_prev_race",
         "rest_category_cat", "is_second_run_after_rest", "is_jockey_changed",
         "jockey_past_win_rate", "jockey_past_place_rate", "jockey_venue_place_rate",
-        "course_bracket_place_rate", "race_front_runner_count"
+        "course_bracket_place_rate", "race_front_runner_count",
+        # 展開負荷・ラップペース特徴量
+        "horse_recent3_avg_pci", "prev_pace_disadvantage_front", "prev_pace_disadvantage_back",
+        "race_expected_pace_cat", "pace_match_score"
     ]
 
     # 3. アンサンブル推論
@@ -107,7 +111,7 @@ def run_backtest() -> None:
         .astype(int)
     )
 
-    # 4. 戦略ルール抽出（複勝・単勝）
+    # 4. 戦略ルール抽出（複勝）
     # 複勝: EV >= 1.0, 確率 >= 45%, 予測3位以内, オッズ >= 5.0倍
     place_bets = test_df[
         (test_df["ev_place"] >= 1.0)

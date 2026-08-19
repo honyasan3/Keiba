@@ -79,7 +79,8 @@ def run_pipeline() -> None:
     # カテゴリ特徴量 & 全特徴量リスト
     cat_cols = [
         "venue_code", "course_type_cat", "weather_cat", "track_condition_cat",
-        "gender_cat", "age_gender_cat", "rest_category_cat", "distance_shock_cat"
+        "gender_cat", "age_gender_cat", "rest_category_cat", "distance_shock_cat",
+        "race_expected_pace_cat"
     ]
     feature_cols = [
         "venue_code", "race_round", "distance", "course_type_cat", "weather_cat",
@@ -91,7 +92,10 @@ def run_pipeline() -> None:
         "horse_recent3_avg_last3f", "horse_recent3_avg_speed_index", "days_since_prev_race",
         "rest_category_cat", "is_second_run_after_rest", "is_jockey_changed",
         "jockey_past_win_rate", "jockey_past_place_rate", "jockey_venue_place_rate",
-        "course_bracket_place_rate", "race_front_runner_count"
+        "course_bracket_place_rate", "race_front_runner_count",
+        # ▼ 新規追加: 展開負荷・ラップペース特徴量 ▼
+        "horse_recent3_avg_pci", "prev_pace_disadvantage_front", "prev_pace_disadvantage_back",
+        "race_expected_pace_cat", "pace_match_score"
     ]
 
     # リーク検証
