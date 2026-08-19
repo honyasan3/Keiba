@@ -1,5 +1,6 @@
-"""フェーズ2: 特徴量エンジニアリング、アンサンブルモデル学習 (LightGBM × CatBoost)、バックテスト実行パイプライン"""
+"""フェーズ2: 特徴量エンジニアリング、トリプルアンサンブル学習 (LGBM × CatBoost × LambdaMART)、バックテスト実行パイプライン（Elo対戦レーティング統合版）"""
 import os
+import numpy as np
 import pandas as pd
 from config.config_loader import ConfigLoader
 from src.common.db import DatabaseConnector
@@ -12,6 +13,7 @@ from src.features.horse_features import PastPerformanceExtractor
 from src.features.race_features import RaceFeatureExtractor
 from src.models.catboost_model import CatBoostRacePredictor
 from src.models.lgbm_model import LGBMRacePredictor
+from src.models.ranker_model import LGBMRankPredictor
 from src.pipeline.repository import RaceModel, RaceResultModel
 
 logger = setup_logger("main_phase2")
@@ -54,16 +56,16 @@ def load_dataset_from_db(connector: DatabaseConnector) -> pd.DataFrame:
 
 
 def run_pipeline() -> None:
-    logger.info("=== フェーズ2 モデル学習・検証パイプラインを開始します ===")
+    logger.info("=== フェーズ2 モデル学習・検証パイプライン（トリプルアンサンブル＆Elo版）を開始します ===")
     config = ConfigLoader.load_config("config/settings.yaml")
     connector = DatabaseConnector(config.db.connection_string)
 
     df_raw = load_dataset_from_db(connector)
     logger.info(f"データ取得完了: 合計 {len(df_raw)} レコード")
 
-    # 1. 特徴量エンジニアリング
+    # 1. 特徴量エンジニアリング（展開負荷・PCI・休養・Eloレーティングを自動生成）
     race_fe = RaceFeatureExtractor()
-    horse_fe = PastPerformanceExtractor(recent_runs=3)
+    horse_fe = PastPerformanceExtractor(recent_runs=3, elo_k_factor=16.0)
 
     df_featured = race_fe.transform(df_raw)
     df_featured = horse_fe.transform(df_featured)
@@ -76,7 +78,7 @@ def run_pipeline() -> None:
         lambda r: 1 if pd.notnull(r) and r == 1 else 0
     )
 
-    # カテゴリ特徴量 & 全特徴量リスト
+    # カテゴリ特徴量 & 全43特徴量リスト（オッズ非依存・ピュア能力）
     cat_cols = [
         "venue_code", "course_type_cat", "weather_cat", "track_condition_cat",
         "gender_cat", "age_gender_cat", "rest_category_cat", "distance_shock_cat",
@@ -93,9 +95,11 @@ def run_pipeline() -> None:
         "rest_category_cat", "is_second_run_after_rest", "is_jockey_changed",
         "jockey_past_win_rate", "jockey_past_place_rate", "jockey_venue_place_rate",
         "course_bracket_place_rate", "race_front_runner_count",
-        # ▼ 新規追加: 展開負荷・ラップペース特徴量 ▼
+        # 展開負荷・ラップペース特徴量
         "horse_recent3_avg_pci", "prev_pace_disadvantage_front", "prev_pace_disadvantage_back",
-        "race_expected_pace_cat", "pace_match_score"
+        "race_expected_pace_cat", "pace_match_score",
+        # ▼ 【フェーズD】Eloレーティング特徴量 ▼
+        "horse_elo_rating", "race_elo_diff_from_mean"
     ]
 
     # リーク検証
@@ -125,8 +129,10 @@ def run_pipeline() -> None:
 
     os.makedirs("models_saved", exist_ok=True)
 
-    # 4. LightGBM学習（複勝モデル target_place を学習）
-    logger.info("--- [1/2] LightGBM モデルの学習を開始 ---")
+    # ----------------------------------------------------
+    # 4. LightGBM 2値分類モデル学習
+    # ----------------------------------------------------
+    logger.info("--- [1/3] LightGBM 2値分類モデルの学習を開始 ---")
     lgbm_predictor = LGBMRacePredictor()
     lgbm_predictor.train(
         X_train=X_train,
@@ -142,10 +148,12 @@ def run_pipeline() -> None:
 
     lgbm_test_preds = lgbm_predictor.predict_proba(X_test)
     lgbm_metrics = MetricsEvaluator.calculate_all_metrics(y_test, lgbm_test_preds)
-    logger.info(f"LightGBM 単体評価 - AUC: {lgbm_metrics['auc']}, LogLoss: {lgbm_metrics['logloss']}")
+    logger.info(f"LightGBM 単体評価 - AUC: {lgbm_metrics['auc']:.4f}, LogLoss: {lgbm_metrics['logloss']:.4f}")
 
-    # 5. CatBoost学習
-    logger.info("--- [2/2] CatBoost モデルの学習を開始 ---")
+    # ----------------------------------------------------
+    # 5. CatBoost 2値分類モデル学習
+    # ----------------------------------------------------
+    logger.info("--- [2/3] CatBoost 2値分類モデルの学習を開始 ---")
     cb_predictor = CatBoostRacePredictor(cat_features=cat_cols)
     cb_predictor.train(
         X_train=X_train,
@@ -158,18 +166,44 @@ def run_pipeline() -> None:
 
     cb_test_preds = cb_predictor.predict_proba(X_test)
     cb_metrics = MetricsEvaluator.calculate_all_metrics(y_test, cb_test_preds)
-    logger.info(f"CatBoost 単体評価 - AUC: {cb_metrics['auc']}, LogLoss: {cb_metrics['logloss']}")
+    logger.info(f"CatBoost 単体評価 - AUC: {cb_metrics['auc']:.4f}, LogLoss: {cb_metrics['logloss']:.4f}")
 
-    # 6. アンサンブル推論 (LightGBM 50% + CatBoost 50%)
-    logger.info("--- [3/3] アンサンブル (LightGBM × CatBoost) 評価 ---")
-    ensemble_preds = (lgbm_test_preds * 0.5) + (cb_test_preds * 0.5)
+    # ----------------------------------------------------
+    # 6. LambdaMART 順位学習モデル学習
+    # ----------------------------------------------------
+    logger.info("--- [3/3] LambdaMART 順位学習モデルの学習を開始 ---")
+    rank_predictor = LGBMRankPredictor()
+    rank_predictor.train(
+        train_df=train_df,
+        val_df=val_df,
+        feature_cols=feature_cols,
+        early_stopping_rounds=50,
+    )
+    rank_predictor.save("models_saved/lambdarank_model.txt")
+
+    # 順位学習スコアを取得し、レース内パーセンタイル（0.0〜1.0）へ正規化
+    rank_test_scores = rank_predictor.predict_score(test_df)
+    test_df_copy = test_df.copy()
+    test_df_copy["_rank_score"] = rank_test_scores
+    rank_norm_scores = test_df_copy.groupby("race_id")["_rank_score"].rank(pct=True).values
+
+    # ----------------------------------------------------
+    # 7. トリプルアンサンブル推論 (LGBM 40% + CatBoost 40% + Ranker 20%)
+    # ----------------------------------------------------
+    logger.info("--- ★ トリプルアンサンブル (LightGBM × CatBoost × LambdaMART) 評価 ---")
+    ensemble_preds = (lgbm_test_preds * 0.40) + (cb_test_preds * 0.40) + (rank_norm_scores * 0.20)
 
     ensemble_metrics = MetricsEvaluator.calculate_all_metrics(y_test, ensemble_preds)
     logger.info(
-        f"★ アンサンブル総合評価 - AUC: {ensemble_metrics['auc']}, LogLoss: {ensemble_metrics['logloss']}, Accuracy: {ensemble_metrics['accuracy']}"
+        f"★ トリプルアンサンブル総合評価 - "
+        f"AUC: {ensemble_metrics['auc']:.4f}, "
+        f"LogLoss: {ensemble_metrics['logloss']:.4f}, "
+        f"Accuracy: {ensemble_metrics['accuracy']:.4f}"
     )
 
-    # 7. バックテスト（アンサンブル確率で実行）
+    # ----------------------------------------------------
+    # 8. バックテスト（アンサンブル確率で実行）
+    # ----------------------------------------------------
     test_df = test_df.copy()
     test_df["pred_prob"] = ensemble_preds
 

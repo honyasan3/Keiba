@@ -1,4 +1,4 @@
-"""リアルタイムレース予想・推論スクリプト（LightGBM × CatBoost アンサンブル × モンテカルロシミュレータ統合版）"""
+"""リアルタイムレース予想・推論スクリプト（トリプルアンサンブル: LGBM × CatBoost × LambdaMART 統合版）"""
 import argparse
 import os
 import re
@@ -14,6 +14,7 @@ from src.features.horse_features import PastPerformanceExtractor
 from src.features.race_features import RaceFeatureExtractor
 from src.models.catboost_model import CatBoostRacePredictor
 from src.models.lgbm_model import LGBMRacePredictor
+from src.models.ranker_model import LGBMRankPredictor
 from src.notification.discord_notifier import DiscordNotifier
 from src.pipeline.cleaner import DataCleaner
 from src.pipeline.repository import RaceModel, RaceResultModel
@@ -23,7 +24,6 @@ logger = setup_logger("predict")
 
 
 def get_historical_data(db_connector: DatabaseConnector) -> pd.DataFrame:
-    """DBから過去のレース実績データを抽出"""
     with db_connector.get_session() as session:
         query = (
             session.query(
@@ -62,9 +62,10 @@ def predict_race(
     race_id: str,
     lgbm_model_path: str = "models_saved/lgbm_model.txt",
     catboost_model_path: str = "models_saved/catboost_model.cbm",
+    ranker_model_path: str = "models_saved/lambdarank_model.txt",
     notify: bool = True,
 ) -> None:
-    logger.info(f"=== Race ID: {race_id} のアンサンブル推論を開始します ===")
+    logger.info(f"=== Race ID: {race_id} のトリプルアンサンブル推論を開始します ===")
 
     config = ConfigLoader.load_config("config/settings.yaml")
     db_connector = DatabaseConnector(config.db.connection_string)
@@ -128,7 +129,6 @@ def predict_race(
         return
 
     hist_df = get_historical_data(db_connector)
-    # DB内に既に存在する同じrace_idのレコードを過去データ側から除外して重複を防ぐ
     hist_df = hist_df[hist_df["race_id"] != race_id].copy()
     combined_df = pd.concat([hist_df, target_df], ignore_index=True)
 
@@ -151,10 +151,12 @@ def predict_race(
         "horse_recent3_avg_last3f", "horse_recent3_avg_speed_index", "days_since_prev_race",
         "rest_category_cat", "is_second_run_after_rest", "is_jockey_changed",
         "jockey_past_win_rate", "jockey_past_place_rate", "jockey_venue_place_rate",
-        "course_bracket_place_rate", "race_front_runner_count"
+        "course_bracket_place_rate", "race_front_runner_count",
+        "horse_recent3_avg_pci", "prev_pace_disadvantage_front", "prev_pace_disadvantage_back",
+        "race_expected_pace_cat", "pace_match_score"
     ]
 
-    # 1. LightGBM & CatBoost によるアンサンブル複勝確率予測
+    # 1. トリプルアンサンブル推論 (LGBM 40% + CatBoost 40% + Ranker 20%)
     lgbm_predictor = LGBMRacePredictor()
     lgbm_predictor.load(lgbm_model_path)
     lgbm_probs = lgbm_predictor.predict_proba(infer_df[feature_cols])
@@ -163,21 +165,28 @@ def predict_race(
         cb_predictor = CatBoostRacePredictor()
         cb_predictor.load(catboost_model_path)
         cb_probs = cb_predictor.predict_proba(infer_df[feature_cols])
-        # アンサンブル (LightGBM 50% + CatBoost 50%)
-        infer_df["pred_place_prob"] = (lgbm_probs * 0.5) + (cb_probs * 0.5)
     else:
-        logger.warning("CatBoostモデルが見つからないため、LightGBM単体で推論します。")
-        infer_df["pred_place_prob"] = lgbm_probs
+        cb_probs = lgbm_probs
 
-    # 2. モンテカルロシミュレーション（ワイド・馬連・ケリー対応）
+    if os.path.exists(ranker_model_path):
+        rank_predictor = LGBMRankPredictor()
+        rank_predictor.load(ranker_model_path)
+        rank_scores = rank_predictor.predict_score(infer_df)
+        infer_df["_rank_score"] = rank_scores
+        rank_norm_scores = infer_df["_rank_score"].rank(pct=True).values
+    else:
+        rank_norm_scores = lgbm_probs
+
+    infer_df["pred_place_prob"] = (lgbm_probs * 0.40) + (cb_probs * 0.40) + (rank_norm_scores * 0.20)
+
+    # 2. モンテカルロシミュレーション
     simulator = MonteCarloRaceSimulator(n_simulations=10000)
     result_df, wide_df, umaren_df = simulator.simulate_race(infer_df, bankroll=10000)
 
-    # 総合複勝率でソート
     result_df = result_df.sort_values("ensemble_place_prob", ascending=False).reset_index(drop=True)
     result_df["pred_rank"] = result_df.index + 1
 
-    # 全頭一覧テーブル表示
+    # 一覧テーブル表示
     print("\n" + "=" * 75)
     print(f" レース予想: {raw_card.get('race_title', '')} (ID: {race_id})")
     print(f" 条件: {raw_card.get('course_type')} {raw_card.get('distance')}m 天候:{raw_card.get('weather')} 馬場:{raw_card.get('track_condition')}")
@@ -198,7 +207,7 @@ def predict_race(
 
     print(tabulate(table_view, headers="keys", tablefmt="fancy_grid", showindex=False))
 
-    # 買い目判定（テスト検証済みの最適化ルール）
+    # 買い目判定
     place_rec = result_df[
         (result_df["ev_place"] >= 1.0)
         & (result_df["ensemble_place_prob"] >= 0.45)
@@ -212,11 +221,10 @@ def predict_race(
         & (result_df["odds"] >= 10.0)
     ]
 
-    # ワイド推奨 (EV >= 1.25 かつ 確率 >= 15%)
     wide_rec = wide_df[(wide_df["ev"] >= 1.25) & (wide_df["prob"] >= 0.15)].head(3) if not wide_df.empty else pd.DataFrame()
 
     print("\n" + "=" * 65)
-    print(" 🎯 【AI × シミュレーション 厳選推奨買い目（資金傾斜付き）】")
+    print(" 🎯 【トリプルAI × シミュレーション 厳選推奨買い目（資金傾斜付き）】")
     print("=" * 65)
     if not place_rec.empty:
         for _, row in place_rec.iterrows():
@@ -244,7 +252,7 @@ def predict_race(
             )
     print("=" * 65 + "\n")
 
-    # 3. Discord通知
+    # Discord通知
     if notify:
         notif_cfg = getattr(config, "notification", None)
         if notif_cfg and getattr(notif_cfg, "enabled", False):

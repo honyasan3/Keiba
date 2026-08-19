@@ -1,4 +1,4 @@
-"""競走馬・騎手・ドメイン特徴量生成モジュール（血統・休養・距離ショック・タイム指数・展開負荷・PCI対応完全版）"""
+"""競走馬・騎手・ドメイン特徴量生成モジュール（走破力・展開負荷・PCI・休養・Elo対戦レーティング完全統合版）"""
 import numpy as np
 import pandas as pd
 from src.common.logger import setup_logger
@@ -8,13 +8,76 @@ logger = setup_logger("horse_features")
 
 
 class PastPerformanceExtractor(BaseFeatureExtractor):
-    """競走馬の過去走、タイム指数、騎手相性、展開ペース、ローテーション、PCI・展開負荷特徴量を算出するクラス"""
+    """競走馬の過去走、タイム指数、騎手相性、展開ペース、ローテーション、PCI、Eloレーティングを算出するクラス"""
 
-    def __init__(self, recent_runs: int = 3) -> None:
+    def __init__(self, recent_runs: int = 3, elo_k_factor: float = 16.0) -> None:
         self.recent_runs = recent_runs
+        self.elo_k_factor = elo_k_factor
+
+    def _calc_elo_ratings(self, df: pd.DataFrame) -> pd.DataFrame:
+        """全過去レースを時系列順に走査し、各馬の発走前Eloレートを時系列リークなしで算出"""
+        logger.info("競走馬Eloレーティング（多頭数直接対決ネットワーク）の算出を開始します。")
+        initial_rating = 1500.0
+        ratings = {}  # {horse_id: current_rating}
+        pre_race_ratings = {}
+
+        # レース順に反復
+        grouped = df.groupby("race_id", sort=False)
+        for race_id, race_df in grouped:
+            race_horses = race_df["horse_id"].tolist()
+            current_race_ratings = {
+                h_id: ratings.get(h_id, initial_rating) for h_id in race_horses
+            }
+
+            for h_id in race_horses:
+                pre_race_ratings[(race_id, h_id)] = current_race_ratings[h_id]
+
+            # 確定着順が存在する場合にレートを更新
+            valid_results = race_df[race_df["rank"].notnull() & (race_df["rank"] > 0)].copy()
+            if len(valid_results) >= 2:
+                valid_results["rank_num"] = pd.to_numeric(valid_results["rank"], errors="coerce")
+                valid_results = valid_results.sort_values("rank_num")
+
+                n_horses = len(valid_results)
+                deltas = {h_id: 0.0 for h_id in valid_results["horse_id"]}
+                horses = valid_results["horse_id"].values
+                ranks = valid_results["rank_num"].values
+
+                for i in range(n_horses):
+                    for j in range(i + 1, n_horses):
+                        h_i, h_j = horses[i], horses[j]
+                        r_i, r_j = current_race_ratings[h_i], current_race_ratings[h_j]
+                        rank_i, rank_j = ranks[i], ranks[j]
+
+                        # 期待勝率（ロジスティック曲線）
+                        exp_i = 1.0 / (1.0 + 10.0 ** ((r_j - r_i) / 400.0))
+                        exp_j = 1.0 - exp_i
+
+                        if rank_i < rank_j:
+                            act_i, act_j = 1.0, 0.0
+                        elif rank_i > rank_j:
+                            act_i, act_j = 0.0, 1.0
+                        else:
+                            act_i, act_j = 0.5, 0.5
+
+                        k_adj = self.elo_k_factor / (n_horses - 1)
+                        deltas[h_i] += k_adj * (act_i - exp_i)
+                        deltas[h_j] += k_adj * (act_j - exp_j)
+
+                for h_id, delta in deltas.items():
+                    ratings[h_id] = current_race_ratings[h_id] + delta
+
+        # データフレームに結合
+        df["horse_elo_rating"] = [
+            pre_race_ratings.get((r_id, h_id), initial_rating)
+            for r_id, h_id in zip(df["race_id"], df["horse_id"])
+        ]
+        race_mean_elo = df.groupby("race_id")["horse_elo_rating"].transform("mean")
+        df["race_elo_diff_from_mean"] = (df["horse_elo_rating"] - race_mean_elo).round(1)
+        return df
 
     def transform(self, df: pd.DataFrame) -> pd.DataFrame:
-        logger.info("競走馬・騎手・ドメイン特徴量（高度ローテーション＆展開負荷・PCI版）の生成を開始します。")
+        logger.info("競走馬・騎手・ドメイン特徴量（ピュア能力＆Eloレーティング版）の生成を開始します。")
         df = df.copy()
 
         # 日付型変換と時系列ソート
@@ -36,7 +99,7 @@ class PastPerformanceExtractor(BaseFeatureExtractor):
             race_mean_time = df.groupby(group_keys)["finish_time_sec"].transform("mean")
             race_std_time = df.groupby(group_keys)["finish_time_sec"].transform("std").fillna(1.0)
             
-            # タイム指数（平均より速いほどプラス値になるよう反転）
+            # タイム指数（平均より速いほどプラス値）
             df["speed_index"] = -((df["finish_time_sec"] - race_mean_time) / race_std_time.clip(lower=0.5)) * 10 + 50
         else:
             df["speed_index"] = np.nan
@@ -84,9 +147,9 @@ class PastPerformanceExtractor(BaseFeatureExtractor):
         df["first_corner_pos"] = [m[0] for m in metrics]
         df["avg_passage_pos"] = [m[1] for m in metrics]
         
-        # レース出走頭数に対する通過割合（0に近いほど逃げ・先行、1に近いほど追込）
+        # レース出走頭数に対する通過割合
         df["horse_avg_passage_rate"] = df["avg_passage_pos"] / df["race_horse_count"].clip(lower=1)
-        # 先行馬フラグ（1コーナー3番手以内）
+        # 先行馬フラグ
         df["is_front_runner"] = (df["first_corner_pos"] <= 3).astype(float)
 
         # ----------------------------------------------------
@@ -95,10 +158,8 @@ class PastPerformanceExtractor(BaseFeatureExtractor):
         logger.info("競走馬の過去走・タイム指数・ローテーション・PCIを算出中...")
         grouped_horse = df.groupby("horse_id")
 
-        # 過去出走数
         df["horse_past_runs"] = grouped_horse.cumcount()
 
-        # 過去平均着順・勝率・複勝率・脚質平均
         past_rank_sum = grouped_horse["rank"].apply(lambda x: x.shift(1).cumsum()).reset_index(level=0, drop=True)
         valid_rank_count = grouped_horse["rank"].apply(lambda x: (~x.shift(1).isna()).cumsum()).reset_index(level=0, drop=True)
         df["horse_past_avg_rank"] = past_rank_sum / valid_rank_count.replace(0, np.nan)
@@ -109,7 +170,6 @@ class PastPerformanceExtractor(BaseFeatureExtractor):
         past_win_sum = grouped_horse["rank"].apply(lambda x: (x.shift(1) == 1).astype(float).cumsum()).reset_index(level=0, drop=True)
         df["horse_past_win_rate"] = past_win_sum / valid_rank_count.replace(0, np.nan)
 
-        # 過去平均通過割合
         past_pass_sum = grouped_horse["horse_avg_passage_rate"].apply(lambda x: x.shift(1).cumsum()).reset_index(level=0, drop=True)
         valid_pass_count = grouped_horse["horse_avg_passage_rate"].apply(lambda x: (~x.shift(1).isna()).cumsum()).reset_index(level=0, drop=True)
         df["horse_avg_passage_rate"] = past_pass_sum / valid_pass_count.replace(0, np.nan)
@@ -139,7 +199,6 @@ class PastPerformanceExtractor(BaseFeatureExtractor):
         # ----------------------------------------------------
         # 4. 展開不利・余力フラグ
         # ----------------------------------------------------
-        # 前走ハイペース先行で潰れた馬 (前走ハイペース ＆ 先行 ＆ 5着以下)
         prev_high_pace = grouped_horse["is_race_high_pace"].shift(1).fillna(0)
         prev_front_pos = grouped_horse["horse_avg_passage_rate"].shift(1).fillna(0.5)
         prev_rank = grouped_horse["rank"].shift(1).fillna(1)
@@ -147,7 +206,6 @@ class PastPerformanceExtractor(BaseFeatureExtractor):
             (prev_high_pace == 1.0) & (prev_front_pos <= 0.30) & (prev_rank >= 5)
         ).astype(float)
 
-        # 前走スロー後方で脚余し (前走スロー ＆ 後方追込)
         prev_slow_pace = grouped_horse["is_race_slow_pace"].shift(1).fillna(0)
         df["prev_pace_disadvantage_back"] = (
             (prev_slow_pace == 1.0) & (prev_front_pos >= 0.70)
@@ -156,19 +214,15 @@ class PastPerformanceExtractor(BaseFeatureExtractor):
         # ----------------------------------------------------
         # 5. ローテーション・休養・距離ショック・性齢特徴量
         # ----------------------------------------------------
-        # 性別カテゴリ (1: 牡, 2: 牝, 3: セ)
         gender_map = {"牡": 1, "牝": 2, "セ": 3}
         df["gender_cat"] = df["gender"].map(gender_map).fillna(1).astype(int)
 
-        # 年齢×性別カテゴリ (例: '牡4', '牝3')
         df["age_gender"] = df["gender"].fillna("牡") + df["age"].fillna(3).astype(str)
         df["age_gender_cat"] = df["age_gender"].astype("category").cat.codes
 
-        # レース間隔日数
         df["prev_race_date"] = grouped_horse["race_date_dt"].shift(1)
         df["days_since_prev_race"] = (df["race_date_dt"] - df["prev_race_date"]).dt.days
 
-        # 休養区分カテゴリ (0: 初出走, 1: 連闘<=7日, 2: 中1〜4週<=28日, 3: 外厩・適度な休み<=90日, 4: 長期休養>90日)
         def _categorize_rest(days):
             if pd.isna(days):
                 return 0
@@ -182,29 +236,24 @@ class PastPerformanceExtractor(BaseFeatureExtractor):
 
         df["rest_category_cat"] = df["days_since_prev_race"].apply(_categorize_rest)
 
-        # 叩き2戦目フラグ（前々走から前走が90日以上空いていて、今回が中4週以内）
         prev2_race_date = grouped_horse["race_date_dt"].shift(2)
         days_prev2_to_prev = (df["prev_race_date"] - prev2_race_date).dt.days
         df["is_second_run_after_rest"] = (
             (days_prev2_to_prev > 90) & (df["days_since_prev_race"] <= 35)
         ).astype(float)
 
-        # 距離変化 & 距離ショック
         df["prev_distance"] = grouped_horse["distance"].shift(1)
         df["distance_diff"] = df["distance"] - df["prev_distance"]
         
-        # 距離短縮(-1), 同距離(0), 距離延長(1)
         df["distance_shock_cat"] = 0
         df.loc[df["distance_diff"] <= -200, "distance_shock_cat"] = -1
         df.loc[df["distance_diff"] >= 200, "distance_shock_cat"] = 1
 
-        # 騎手乗り替わりフラグ
         df["prev_jockey"] = grouped_horse["jockey_name"].shift(1)
         df["is_jockey_changed"] = (
             (df["prev_jockey"].notna()) & (df["jockey_name"] != df["prev_jockey"])
         ).astype(float)
 
-        # 体重増減率（%）
         if "horse_weight" in df.columns and "horse_weight_diff" in df.columns:
             df["horse_weight_diff_rate"] = (df["horse_weight_diff"] / df["horse_weight"].replace(0, np.nan)) * 100
         else:
@@ -223,14 +272,12 @@ class PastPerformanceExtractor(BaseFeatureExtractor):
         jockey_win_sum = grouped_jockey["rank"].apply(lambda x: (x.shift(1) == 1).astype(float).cumsum()).reset_index(level=0, drop=True)
         df["jockey_past_win_rate"] = jockey_win_sum / jockey_valid_runs.replace(0, np.nan)
 
-        # 騎手 × 競馬場相性
         df["jockey_venue"] = df["jockey_name"] + "_" + df["race_id"].str[4:6]
         grouped_jv = df.groupby("jockey_venue")
         jv_valid_runs = grouped_jv["rank"].apply(lambda x: (~x.shift(1).isna()).cumsum()).reset_index(level=0, drop=True)
         jv_placed_sum = grouped_jv["is_placed"].apply(lambda x: x.shift(1).cumsum()).reset_index(level=0, drop=True)
         df["jockey_venue_place_rate"] = jv_placed_sum / jv_valid_runs.replace(0, np.nan)
 
-        # コース種別 × 枠番の好走率（枠順バイアス）
         df["course_bracket"] = df["course_type"] + "_" + df["bracket_num"].astype(str)
         grouped_cb = df.groupby("course_bracket")
         cb_valid_runs = grouped_cb["rank"].apply(lambda x: (~x.shift(1).isna()).cumsum()).reset_index(level=0, drop=True)
@@ -238,18 +285,16 @@ class PastPerformanceExtractor(BaseFeatureExtractor):
         df["course_bracket_place_rate"] = cb_placed_sum / cb_valid_runs.replace(0, np.nan)
 
         # ----------------------------------------------------
-        # 7. レース展開（先行頭数・想定ペース・脚質マッチ度）
+        # 7. レース展開
         # ----------------------------------------------------
         df["race_front_runner_count"] = df.groupby("race_id")["is_front_runner"].transform("sum")
 
-        # 想定ペース区分 (3: ハイペース, 2: ミドル, 1: スロー)
         front_ratio = df["race_front_runner_count"] / df["race_horse_count"].clip(lower=1)
         df["race_expected_pace_cat"] = np.where(
             front_ratio >= 0.30, 3,
             np.where(front_ratio <= 0.15, 1, 2)
         )
 
-        # 脚質適合スコア（ハイペースなら差し追込有利、スローなら先行有利）
         df["pace_match_score"] = np.where(
             df["race_expected_pace_cat"] == 3,
             df["horse_avg_passage_rate"].fillna(0.5),
@@ -260,5 +305,10 @@ class PastPerformanceExtractor(BaseFeatureExtractor):
             ),
         ).round(3)
 
-        logger.info("高度特徴量の生成が完了しました。")
+        # ----------------------------------------------------
+        # 8. 【フェーズD】競走馬Eloレーティング（直接対決ネットワーク）
+        # ----------------------------------------------------
+        df = self._calc_elo_ratings(df)
+
+        logger.info("ピュア走破能力＆Eloドメイン特徴量（全43特徴量）の生成が完了しました。")
         return df

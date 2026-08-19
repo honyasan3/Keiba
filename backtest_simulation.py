@@ -1,4 +1,4 @@
-"""過去テストデータを用いた長期運用シミュレーションスクリプト（アンサンブル × ケリー資金管理版）"""
+"""過去テストデータを用いた長期運用シミュレーションスクリプト（Eloレーティング＆ピュア能力版）"""
 import numpy as np
 import pandas as pd
 from tabulate import tabulate
@@ -6,10 +6,12 @@ from config.config_loader import ConfigLoader
 from src.common.db import DatabaseConnector
 from src.common.logger import setup_logger
 from src.dataset.time_splitter import TimeSeriesDataSplitter
+from src.features.elo_engine import EloRatingEngine
 from src.features.horse_features import PastPerformanceExtractor
 from src.features.race_features import RaceFeatureExtractor
 from src.models.catboost_model import CatBoostRacePredictor
 from src.models.lgbm_model import LGBMRacePredictor
+from src.models.ranker_model import LGBMRankPredictor
 from src.pipeline.repository import RaceModel, RaceResultModel
 
 logger = setup_logger("backtest_simulation")
@@ -51,29 +53,26 @@ def load_dataset(db_connector: DatabaseConnector) -> pd.DataFrame:
 
 
 def run_backtest() -> None:
-    logger.info("=== 長期運用バックテストを開始します ===")
+    logger.info("=== 長期運用バックテスト（ピュア能力 × Elo対戦レーティング版）を開始します ===")
     config = ConfigLoader.load_config("config/settings.yaml")
     connector = DatabaseConnector(config.db.connection_string)
 
     df_raw = load_dataset(connector)
     logger.info(f"データ取得完了: 合計 {len(df_raw)} 件")
 
-    # 1. 特徴量生成
     race_fe = RaceFeatureExtractor()
     horse_fe = PastPerformanceExtractor(recent_runs=3)
+    elo_engine = EloRatingEngine(k_factor=16.0)
 
     df_featured = race_fe.transform(df_raw)
     df_featured = horse_fe.transform(df_featured)
+    df_featured = elo_engine.compute_ratings(df_featured)
 
-    # 2. 時系列データ分割（テストセット抽出）
     splitter = TimeSeriesDataSplitter()
     _, _, test_df = splitter.split_by_date(
         df_featured, train_end="2025-11-08", val_end="2026-03-22"
     )
 
-    logger.info(f"バックテスト対象期間: {test_df['race_date'].min()} 〜 {test_df['race_date'].max()} ({len(test_df)} 件)")
-
-    # 41特徴量リスト
     feature_cols = [
         "venue_code", "race_round", "distance", "course_type_cat", "weather_cat",
         "track_condition_cat", "bracket_num", "horse_num", "gender_cat", "age", "age_gender_cat",
@@ -85,12 +84,11 @@ def run_backtest() -> None:
         "rest_category_cat", "is_second_run_after_rest", "is_jockey_changed",
         "jockey_past_win_rate", "jockey_past_place_rate", "jockey_venue_place_rate",
         "course_bracket_place_rate", "race_front_runner_count",
-        # 展開負荷・ラップペース特徴量
         "horse_recent3_avg_pci", "prev_pace_disadvantage_front", "prev_pace_disadvantage_back",
-        "race_expected_pace_cat", "pace_match_score"
+        "race_expected_pace_cat", "pace_match_score",
+        "horse_elo_rating", "race_elo_diff_from_mean"
     ]
 
-    # 3. アンサンブル推論
     lgbm_predictor = LGBMRacePredictor()
     lgbm_predictor.load("models_saved/lgbm_model.txt")
     lgbm_preds = lgbm_predictor.predict_proba(test_df[feature_cols])
@@ -99,10 +97,17 @@ def run_backtest() -> None:
     cb_predictor.load("models_saved/catboost_model.cbm")
     cb_preds = cb_predictor.predict_proba(test_df[feature_cols])
 
-    test_df = test_df.copy()
-    test_df["pred_place_prob"] = (lgbm_preds * 0.5) + (cb_preds * 0.5)
+    rank_predictor = LGBMRankPredictor()
+    rank_predictor.load("models_saved/lambdarank_model.txt")
+    rank_scores = rank_predictor.predict_score(test_df)
 
-    # 推定複勝オッズおよびEV算出
+    test_df = test_df.copy()
+    test_df["_rank_score"] = rank_scores
+    rank_norm_scores = test_df.groupby("race_id")["_rank_score"].rank(pct=True).values
+
+    test_df["pred_place_prob"] = (lgbm_preds * 0.40) + (cb_preds * 0.40) + (rank_norm_scores * 0.20)
+
+    # 推定複勝オッズおよびEV
     test_df["est_place_odds"] = np.clip(1.1 + (test_df["odds"] - 1.0) * 0.28, 1.1, 15.0)
     test_df["ev_place"] = test_df["pred_place_prob"] * test_df["est_place_odds"]
     test_df["pred_rank"] = (
@@ -111,8 +116,7 @@ def run_backtest() -> None:
         .astype(int)
     )
 
-    # 4. 戦略ルール抽出（複勝）
-    # 複勝: EV >= 1.0, 確率 >= 45%, 予測3位以内, オッズ >= 5.0倍
+    # 厳選勝負ルール（EV >= 1.0, 確率 >= 45%, 予測3位以内, 単勝オッズ >= 5.0倍）
     place_bets = test_df[
         (test_df["ev_place"] >= 1.0)
         & (test_df["pred_place_prob"] >= 0.45)
@@ -120,7 +124,7 @@ def run_backtest() -> None:
         & (test_df["odds"] >= 5.0)
     ].copy()
 
-    # ケリー基準による賭け金（100円〜1000円）
+    # ケリー基準
     b = np.maximum(place_bets["est_place_odds"] - 1.0, 0.01)
     p = place_bets["pred_place_prob"]
     q = 1.0 - p
@@ -128,7 +132,6 @@ def run_backtest() -> None:
     fractional_kelly = f_star * 0.15
     place_bets["bet_amount"] = (np.clip(fractional_kelly * 10000, 100, 1000) // 100 * 100).astype(int)
 
-    # 的中判定（3着以内）
     place_bets["is_hit"] = place_bets["rank"].apply(lambda r: 1 if pd.notnull(r) and 1 <= r <= 3 else 0)
     place_bets["payout"] = np.where(
         place_bets["is_hit"] == 1,
@@ -136,7 +139,6 @@ def run_backtest() -> None:
         0.0
     ).astype(int)
 
-    # 日付・月別集計
     place_bets["month"] = pd.to_datetime(place_bets["race_date"]).dt.strftime("%Y-%m")
 
     monthly_summary = place_bets.groupby("month").agg(
@@ -150,7 +152,6 @@ def run_backtest() -> None:
     monthly_summary["profit"] = monthly_summary["total_return"] - monthly_summary["total_invest"]
     monthly_summary["roi"] = (monthly_summary["total_return"] / monthly_summary["total_invest"] * 100).round(2).astype(str) + "%"
 
-    # 全体サマリー
     total_invest = place_bets["bet_amount"].sum()
     total_return = place_bets["payout"].sum()
     total_profit = total_return - total_invest
@@ -158,7 +159,7 @@ def run_backtest() -> None:
     hit_rate = (place_bets["is_hit"].sum() / len(place_bets) * 100) if len(place_bets) > 0 else 0.0
 
     print("\n" + "=" * 70)
-    print(" 📈 【テスト期間（2026年3月〜8月）複勝アンサンブル・バックテスト結果】")
+    print(" 📈 【テスト期間（2026年3月〜8月）Eloレーティング統合 バックテスト結果】")
     print("=" * 70)
     print(tabulate(monthly_summary, headers=["月度", "購入数", "的中数", "投資額", "払戻額", "的中率", "収支", "回収率(ROI)"], tablefmt="fancy_grid", showindex=False))
 
