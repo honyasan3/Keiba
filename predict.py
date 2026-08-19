@@ -1,5 +1,6 @@
-"""リアルタイムレース予想・推論スクリプト（LightGBM × モンテカルロシミュレータ統合版）"""
+"""リアルタイムレース予想・推論スクリプト（LightGBM × CatBoost アンサンブル × モンテカルロシミュレータ統合版）"""
 import argparse
+import os
 import re
 import pandas as pd
 from tabulate import tabulate
@@ -11,6 +12,7 @@ from src.crawler.race_scraper import RaceScraper
 from src.crawler.shutuba_parser import ShutubaHtmlParser
 from src.features.horse_features import PastPerformanceExtractor
 from src.features.race_features import RaceFeatureExtractor
+from src.models.catboost_model import CatBoostRacePredictor
 from src.models.lgbm_model import LGBMRacePredictor
 from src.notification.discord_notifier import DiscordNotifier
 from src.pipeline.cleaner import DataCleaner
@@ -58,10 +60,11 @@ def get_historical_data(db_connector: DatabaseConnector) -> pd.DataFrame:
 
 def predict_race(
     race_id: str,
-    model_path: str = "models_saved/lgbm_model.txt",
+    lgbm_model_path: str = "models_saved/lgbm_model.txt",
+    catboost_model_path: str = "models_saved/catboost_model.cbm",
     notify: bool = True,
 ) -> None:
-    logger.info(f"=== Race ID: {race_id} の推論を開始します ===")
+    logger.info(f"=== Race ID: {race_id} のアンサンブル推論を開始します ===")
 
     config = ConfigLoader.load_config("config/settings.yaml")
     db_connector = DatabaseConnector(config.db.connection_string)
@@ -136,26 +139,35 @@ def predict_race(
     combined_df = race_fe.transform(combined_df)
     combined_df = horse_fe.transform(combined_df)
 
-    infer_df = combined_df[combined_df["race_id"] == race_id].copy()
-
-    predictor = LGBMRacePredictor()
-    predictor.load(model_path)
+    infer_df = combined_df[combined_df["race_id"] == race_id].copy().reset_index(drop=True)
 
     feature_cols = [
-            "venue_code", "race_round", "distance", "course_type_cat", "weather_cat",
-            "track_condition_cat", "bracket_num", "horse_num", "gender_cat", "age", "age_gender_cat",
-            "jockey_weight", "jockey_weight_diff_from_race_mean", "race_horse_count",
-            "horse_weight", "horse_weight_diff", "horse_weight_diff_rate",
-            "horse_past_runs", "horse_past_avg_rank", "horse_past_win_rate", "horse_past_place_rate",
-            "horse_avg_passage_rate", "distance_diff", "distance_shock_cat", "horse_recent3_avg_rank",
-            "horse_recent3_avg_last3f", "horse_recent3_avg_speed_index", "days_since_prev_race",
-            "rest_category_cat", "is_second_run_after_rest", "is_jockey_changed",
-            "jockey_past_win_rate", "jockey_past_place_rate", "jockey_venue_place_rate",
-            "course_bracket_place_rate", "race_front_runner_count"
-        ]
+        "venue_code", "race_round", "distance", "course_type_cat", "weather_cat",
+        "track_condition_cat", "bracket_num", "horse_num", "gender_cat", "age", "age_gender_cat",
+        "jockey_weight", "jockey_weight_diff_from_race_mean", "race_horse_count",
+        "horse_weight", "horse_weight_diff", "horse_weight_diff_rate",
+        "horse_past_runs", "horse_past_avg_rank", "horse_past_win_rate", "horse_past_place_rate",
+        "horse_avg_passage_rate", "distance_diff", "distance_shock_cat", "horse_recent3_avg_rank",
+        "horse_recent3_avg_last3f", "horse_recent3_avg_speed_index", "days_since_prev_race",
+        "rest_category_cat", "is_second_run_after_rest", "is_jockey_changed",
+        "jockey_past_win_rate", "jockey_past_place_rate", "jockey_venue_place_rate",
+        "course_bracket_place_rate", "race_front_runner_count"
+    ]
 
-# 1. LightGBMによる複勝確率予測
-    infer_df["pred_place_prob"] = predictor.predict_proba(infer_df[feature_cols])
+    # 1. LightGBM & CatBoost によるアンサンブル複勝確率予測
+    lgbm_predictor = LGBMRacePredictor()
+    lgbm_predictor.load(lgbm_model_path)
+    lgbm_probs = lgbm_predictor.predict_proba(infer_df[feature_cols])
+
+    if os.path.exists(catboost_model_path):
+        cb_predictor = CatBoostRacePredictor()
+        cb_predictor.load(catboost_model_path)
+        cb_probs = cb_predictor.predict_proba(infer_df[feature_cols])
+        # アンサンブル (LightGBM 50% + CatBoost 50%)
+        infer_df["pred_place_prob"] = (lgbm_probs * 0.5) + (cb_probs * 0.5)
+    else:
+        logger.warning("CatBoostモデルが見つからないため、LightGBM単体で推論します。")
+        infer_df["pred_place_prob"] = lgbm_probs
 
     # 2. モンテカルロシミュレーション（ワイド・馬連・ケリー対応）
     simulator = MonteCarloRaceSimulator(n_simulations=10000)
@@ -186,17 +198,17 @@ def predict_race(
 
     print(tabulate(table_view, headers="keys", tablefmt="fancy_grid", showindex=False))
 
-    # 買い目判定
+    # 買い目判定（テスト検証済みの最適化ルール）
     place_rec = result_df[
-        (result_df["ev_place"] >= 1.1)
-        & (result_df["ensemble_place_prob"] >= 0.40)
+        (result_df["ev_place"] >= 1.0)
+        & (result_df["ensemble_place_prob"] >= 0.45)
         & (result_df["pred_rank"] <= 3)
-        & (result_df["odds"] >= 3.0)
+        & (result_df["odds"] >= 5.0)
     ]
 
     win_candidate = result_df[
         (result_df["pred_rank"] == 1)
-        & (result_df["ensemble_place_prob"] >= 0.35)
+        & (result_df["sim_win_prob"] >= 0.20)
         & (result_df["odds"] >= 10.0)
     ]
 
@@ -231,19 +243,19 @@ def predict_race(
                 f"(的中率: {row['prob']*100:.1f}%, 想定: {row['est_odds']}倍, EV: {row['ev']:.2f})"
             )
     print("=" * 65 + "\n")
-    
+
     # 3. Discord通知
     if notify:
-            notif_cfg = getattr(config, "notification", None)
-            if notif_cfg and getattr(notif_cfg, "enabled", False):
-                notifier = DiscordNotifier(webhook_url=notif_cfg.discord_webhook_url, enabled=True)
-                notifier.send_prediction_report(
-                    race_info=raw_card,
-                    top_entries=result_df.to_dict(orient="records"),
-                    place_recommendations=place_rec.to_dict(orient="records"),
-                    win_recommendations=win_candidate.to_dict(orient="records"),
-                    wide_recommendations=wide_rec.to_dict(orient="records") if not wide_rec.empty else [],
-                )
+        notif_cfg = getattr(config, "notification", None)
+        if notif_cfg and getattr(notif_cfg, "enabled", False):
+            notifier = DiscordNotifier(webhook_url=notif_cfg.discord_webhook_url, enabled=True)
+            notifier.send_prediction_report(
+                race_info=raw_card,
+                top_entries=result_df.to_dict(orient="records"),
+                place_recommendations=place_rec.to_dict(orient="records"),
+                win_recommendations=win_candidate.to_dict(orient="records"),
+                wide_recommendations=wide_rec.to_dict(orient="records") if not wide_rec.empty else [],
+            )
 
 
 if __name__ == "__main__":

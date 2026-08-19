@@ -125,3 +125,60 @@ class DiscordNotifier:
         except Exception as e:
             logger.error(f"Discord通知送信中に例外が発生しました: {e}")
             return False
+
+    def send_settlement_report(self, settlement: Dict[str, Any], date_str: str) -> bool:
+            """1日の確定収支レポートをDiscordへ通知"""
+            if not self.enabled or not self.webhook_url or "YOUR_DISCORD" in self.webhook_url:
+                return False
+
+            profit = settlement["profit"]
+            roi = settlement["roi"]
+            # プラス収支: ゴールド 0xF1C40F / マイナス: 深紅 0xE74C3C
+            embed_color = 0xF1C40F if profit >= 0 else 0xE74C3C
+
+            lines = ["```text"]
+            lines.append("レース             券種  対象馬          投資    払戻   結果")
+            lines.append("──────────────────────────────────────────────────────────")
+            for d in settlement["details"]:
+                rtitle = d["race_title"][:8].ljust(9, " ")
+                btype = d["bet_type"].ljust(3, " ")
+                horse = d["horse"][:9].ljust(10, " ")
+                res_mark = "🎯 的中" if d["is_hit"] else "✕ はずれ"
+                lines.append(
+                    f"{rtitle} {btype} {horse} {d['invest']:>5}円 {d['payout']:>6}円  {res_mark}"
+                )
+            lines.append("```")
+
+            summary_field = (
+                f"**総投資額**: `{settlement['total_invest']:,} 円`\n"
+                f"**総払戻額**: `{settlement['total_return']:,} 円`\n"
+                f"**本日収支**: `{'＋' if profit >= 0 else ''}{profit:,} 円`\n"
+                f"**的中率**: `{settlement['hit_rate']:.1f}%` ({settlement['hit_count']}/{settlement['bet_count']})\n"
+                f"**回収率 (ROI)**: **`{roi:.1f}%`**"
+            )
+
+            payload = {
+                "username": "keiba_ai_predictor",
+                "embeds": [
+                    {
+                        "title": f"💰 【本日のAI運用 確定収支レポート】 ({date_str})",
+                        "description": summary_field,
+                        "color": embed_color,
+                        "fields": [
+                            {
+                                "name": "📋 推奨買い目 精算明細",
+                                "value": "\n".join(lines),
+                                "inline": False,
+                            }
+                        ],
+                        "footer": {"text": "Keiba AI 自動精算システム"},
+                    }
+                ],
+            }
+
+            try:
+                res = requests.post(self.webhook_url, json=payload, timeout=10)
+                return res.status_code == 204
+            except Exception as e:
+                logger.error(f"収支レポート送信失敗: {e}")
+                return False
