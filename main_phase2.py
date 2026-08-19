@@ -77,12 +77,13 @@ def run_pipeline() -> None:
     # 特徴量リスト
     feature_cols = [
             "venue_code", "race_round", "distance", "course_type_cat", "weather_cat",
-            "track_condition_cat", "bracket_num", "horse_num", "gender_cat", "age",
+            "track_condition_cat", "bracket_num", "horse_num", "gender_cat", "age", "age_gender_cat",
             "jockey_weight", "jockey_weight_diff_from_race_mean", "race_horse_count",
             "horse_weight", "horse_weight_diff", "horse_weight_diff_rate",
             "horse_past_runs", "horse_past_avg_rank", "horse_past_win_rate", "horse_past_place_rate",
-            "horse_avg_passage_rate", "distance_diff", "horse_recent3_avg_rank",
+            "horse_avg_passage_rate", "distance_diff", "distance_shock_cat", "horse_recent3_avg_rank",
             "horse_recent3_avg_last3f", "horse_recent3_avg_speed_index", "days_since_prev_race",
+            "rest_category_cat", "is_second_run_after_rest", "is_jockey_changed",
             "jockey_past_win_rate", "jockey_past_place_rate", "jockey_venue_place_rate",
             "course_bracket_place_rate", "race_front_runner_count"
         ]

@@ -1,7 +1,6 @@
-"""ベッティング戦略最適化 実行スクリプト"""
+"""ベッティング戦略最適化スクリプト（最新36特徴量・tabulate出力対応版）"""
 import pandas as pd
 from tabulate import tabulate
-
 from config.config_loader import ConfigLoader
 from src.common.db import DatabaseConnector
 from src.common.logger import setup_logger
@@ -15,11 +14,7 @@ from src.pipeline.repository import RaceModel, RaceResultModel
 logger = setup_logger("optimize_betting")
 
 
-def run_optimization():
-    config = ConfigLoader.load_config("config/settings.yaml")
-    db_connector = DatabaseConnector(config.db.connection_string)
-
-    logger.info("DBから学習・検証用データを読み込み中...")
+def get_all_race_data(db_connector: DatabaseConnector) -> pd.DataFrame:
     with db_connector.get_session() as session:
         query = (
             session.query(
@@ -51,58 +46,78 @@ def run_optimization():
             )
             .join(RaceResultModel, RaceModel.race_id == RaceResultModel.race_id)
         )
-        df = pd.DataFrame(query.all())
+        return pd.DataFrame(query.all())
+
+
+def run_optimization() -> None:
+    config = ConfigLoader.load_config("config/settings.yaml")
+    db_connector = DatabaseConnector(config.db.connection_string)
+
+    raw_df = get_all_race_data(db_connector)
+    if raw_df.empty:
+        logger.error("データベースからデータを取得できませんでした。")
+        return
 
     # 特徴量生成
     race_fe = RaceFeatureExtractor()
     horse_fe = PastPerformanceExtractor(recent_runs=3)
-    df = race_fe.transform(df)
-    df = horse_fe.transform(df)
 
-    # 日付でソートして時系列分割点を自動計算 (Train: 70%, Val: 15%, Test: 15%)
-    unique_dates = sorted(df["race_date"].dropna().unique())
-    n_dates = len(unique_dates)
-    train_end = unique_dates[int(n_dates * 0.70)]
-    val_end = unique_dates[int(n_dates * 0.85)]
+    featured_df = race_fe.transform(raw_df)
+    featured_df = horse_fe.transform(featured_df)
 
-    logger.info(f"評価データ期間: {val_end} 以降のテストデータを対象に検証します")
-    _, _, test_df = TimeSeriesDataSplitter.split_by_date(
-        df, train_end=train_end, val_end=val_end
+    # 時系列分割 (Train / Val / Test)
+    splitter = TimeSeriesDataSplitter()
+    _, _, test_df = splitter.split_by_date(
+        featured_df, train_end="2025-11-08", val_end="2026-03-22"
     )
 
-    feature_cols = [
-            "venue_code", "race_round", "distance", "course_type_cat", "weather_cat",
-            "track_condition_cat", "bracket_num", "horse_num", "gender_cat", "age",
-            "jockey_weight", "jockey_weight_diff_from_race_mean", "race_horse_count",
-            "horse_weight", "horse_weight_diff", "horse_weight_diff_rate",
-            "horse_past_runs", "horse_past_avg_rank", "horse_past_win_rate", "horse_past_place_rate",
-            "horse_avg_passage_rate", "distance_diff", "horse_recent3_avg_rank",
-            "horse_recent3_avg_last3f", "horse_recent3_avg_speed_index", "days_since_prev_race",
-            "jockey_past_win_rate", "jockey_past_place_rate", "jockey_venue_place_rate",
-            "course_bracket_place_rate", "race_front_runner_count"
-        ]
+    logger.info(f"評価データ期間: {test_df['race_date'].min()} 以降のテストデータを対象に検証します")
 
+    # モデル読み込みと推論
     predictor = LGBMRacePredictor()
     predictor.load("models_saved/lgbm_model.txt")
 
+    feature_cols = [
+        "venue_code", "race_round", "distance", "course_type_cat", "weather_cat",
+        "track_condition_cat", "bracket_num", "horse_num", "gender_cat", "age", "age_gender_cat",
+        "jockey_weight", "jockey_weight_diff_from_race_mean", "race_horse_count",
+        "horse_weight", "horse_weight_diff", "horse_weight_diff_rate",
+        "horse_past_runs", "horse_past_avg_rank", "horse_past_win_rate", "horse_past_place_rate",
+        "horse_avg_passage_rate", "distance_diff", "distance_shock_cat", "horse_recent3_avg_rank",
+        "horse_recent3_avg_last3f", "horse_recent3_avg_speed_index", "days_since_prev_race",
+        "rest_category_cat", "is_second_run_after_rest", "is_jockey_changed",
+        "jockey_past_win_rate", "jockey_past_place_rate", "jockey_venue_place_rate",
+        "course_bracket_place_rate", "race_front_runner_count"
+    ]
+
+    test_df = test_df.copy()
     test_df["pred_place_prob"] = predictor.predict_proba(test_df[feature_cols])
-    test_df["pred_rank"] = test_df.groupby("race_id")["pred_place_prob"].rank(ascending=False, method="min")
+
+    # レースごとの予測順位 (pred_rank) を算出
+    test_df["pred_rank"] = (
+        test_df.groupby("race_id")["pred_place_prob"]
+        .rank(ascending=False, method="min")
+        .astype(int)
+    )
+
+    # グリッドサーチ最適化
+    optimizer = BettingStrategyOptimizer()
 
     logger.info("=== 複勝ベッティングルールの最適化中 ===")
-    place_opt = BettingStrategyOptimizer.optimize_place_strategy(test_df, min_bets=30)
+    place_results = optimizer.optimize_place_strategy(test_df)
     print("\n【複勝 最適戦略 Top 5】")
-    if not place_opt.empty:
-        print(tabulate(place_opt.head(5), headers="keys", tablefmt="fancy_grid", showindex=False))
+    if not place_results.empty:
+        print(tabulate(place_results.head(5), headers="keys", tablefmt="github", showindex=False))
     else:
-        print("基準を満たす戦略が見つかりませんでした。")
+        print("条件を満たす戦略が見つかりませんでした。")
 
     logger.info("=== 単勝ベッティングルールの最適化中 ===")
-    win_opt = BettingStrategyOptimizer.optimize_win_strategy(test_df, min_bets=30)
+    win_results = optimizer.optimize_win_strategy(test_df)
     print("\n【単勝 最適戦略 Top 5】")
-    if not win_opt.empty:
-        print(tabulate(win_opt.head(5), headers="keys", tablefmt="fancy_grid", showindex=False))
+    if not win_results.empty:
+        print(tabulate(win_results.head(5), headers="keys", tablefmt="github", showindex=False))
     else:
-        print("基準を満たす戦略が見つかりませんでした。")
+        print("条件を満たす戦略が見つかりませんでした。")
 
 
 if __name__ == "__main__":
