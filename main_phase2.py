@@ -15,6 +15,7 @@ from src.models.catboost_model import CatBoostRacePredictor
 from src.models.lgbm_model import LGBMRacePredictor
 from src.models.ranker_model import LGBMRankPredictor
 from src.pipeline.repository import RaceModel, RaceResultModel
+from src.features.track_bias_features import TrackBiasFeatureExtractor
 
 logger = setup_logger("main_phase2")
 
@@ -66,9 +67,11 @@ def run_pipeline() -> None:
     # 1. 特徴量エンジニアリング（展開負荷・PCI・休養・Eloレーティングを自動生成）
     race_fe = RaceFeatureExtractor()
     horse_fe = PastPerformanceExtractor(recent_runs=3, elo_k_factor=16.0)
+    bias_fe = TrackBiasFeatureExtractor()
 
     df_featured = race_fe.transform(df_raw)
     df_featured = horse_fe.transform(df_featured)
+    df_featured = bias_fe.transform(df_featured)
 
     # 2. 目的変数の設定 (3着以内 = 1, それ以外 = 0)
     df_featured["target_place"] = df_featured["rank"].apply(
@@ -98,8 +101,10 @@ def run_pipeline() -> None:
         # 展開負荷・ラップペース特徴量
         "horse_recent3_avg_pci", "prev_pace_disadvantage_front", "prev_pace_disadvantage_back",
         "race_expected_pace_cat", "pace_match_score",
-        # ▼ 【フェーズD】Eloレーティング特徴量 ▼
-        "horse_elo_rating", "race_elo_diff_from_mean"
+        # Eloレーティング特徴量
+        "horse_elo_rating", "race_elo_diff_from_mean",
+        # ★ 当日トラックバイアス特徴量 ★
+        "bias_inner_bracket_advantage", "bias_front_runner_advantage", "bias_horse_match_score"
     ]
 
     # リーク検証

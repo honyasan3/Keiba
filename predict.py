@@ -1,4 +1,4 @@
-"""リアルタイムレース予想・推論スクリプト（トリプルアンサンブル: LGBM × CatBoost × LambdaMART 統合版）"""
+"""リアルタイムレース予想・推論スクリプト（トリプルアンサンブル: LGBM × CatBoost × LambdaMART & Elo & 当日トラックバイアス統合版）"""
 import argparse
 import os
 import re
@@ -12,6 +12,7 @@ from src.crawler.race_scraper import RaceScraper
 from src.crawler.shutuba_parser import ShutubaHtmlParser
 from src.features.horse_features import PastPerformanceExtractor
 from src.features.race_features import RaceFeatureExtractor
+from src.features.track_bias_features import TrackBiasFeatureExtractor
 from src.models.catboost_model import CatBoostRacePredictor
 from src.models.lgbm_model import LGBMRacePredictor
 from src.models.ranker_model import LGBMRankPredictor
@@ -132,15 +133,18 @@ def predict_race(
     hist_df = hist_df[hist_df["race_id"] != race_id].copy()
     combined_df = pd.concat([hist_df, target_df], ignore_index=True)
 
-    # 特徴量抽出
+    # 特徴量抽出（ピュア能力・Eloレーティング・当日トラックバイアス）
     race_fe = RaceFeatureExtractor()
-    horse_fe = PastPerformanceExtractor(recent_runs=3)
+    horse_fe = PastPerformanceExtractor(recent_runs=3, elo_k_factor=16.0)
+    bias_fe = TrackBiasFeatureExtractor()
 
     combined_df = race_fe.transform(combined_df)
     combined_df = horse_fe.transform(combined_df)
+    combined_df = bias_fe.transform(combined_df)
 
     infer_df = combined_df[combined_df["race_id"] == race_id].copy().reset_index(drop=True)
 
+    # 全46特徴量リスト（main_phase2と完全一致）
     feature_cols = [
         "venue_code", "race_round", "distance", "course_type_cat", "weather_cat",
         "track_condition_cat", "bracket_num", "horse_num", "gender_cat", "age", "age_gender_cat",
@@ -152,8 +156,13 @@ def predict_race(
         "rest_category_cat", "is_second_run_after_rest", "is_jockey_changed",
         "jockey_past_win_rate", "jockey_past_place_rate", "jockey_venue_place_rate",
         "course_bracket_place_rate", "race_front_runner_count",
+        # 展開負荷・ラップペース特徴量
         "horse_recent3_avg_pci", "prev_pace_disadvantage_front", "prev_pace_disadvantage_back",
-        "race_expected_pace_cat", "pace_match_score"
+        "race_expected_pace_cat", "pace_match_score",
+        # Eloレーティング特徴量
+        "horse_elo_rating", "race_elo_diff_from_mean",
+        # 当日トラックバイアス特徴量
+        "bias_inner_bracket_advantage", "bias_front_runner_advantage", "bias_horse_match_score"
     ]
 
     # 1. トリプルアンサンブル推論 (LGBM 40% + CatBoost 40% + Ranker 20%)
