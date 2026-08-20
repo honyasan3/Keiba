@@ -216,9 +216,9 @@ def predict_race(
 
     print(tabulate(table_view, headers="keys", tablefmt="fancy_grid", showindex=False))
 
-    # 買い目判定
+    # 買い目判定（データ拡充後グリッドサーチ最適化パラメータ）
     place_rec = result_df[
-        (result_df["ev_place"] >= 1.0)
+        (result_df["ev_place"] >= 1.5)
         & (result_df["ensemble_place_prob"] >= 0.45)
         & (result_df["pred_rank"] <= 3)
         & (result_df["odds"] >= 5.0)
@@ -226,8 +226,9 @@ def predict_race(
 
     win_candidate = result_df[
         (result_df["pred_rank"] == 1)
-        & (result_df["sim_win_prob"] >= 0.20)
+        & (result_df["sim_win_prob"] >= 0.25)
         & (result_df["odds"] >= 10.0)
+        & (result_df["ev_place"] >= 1.2)
     ]
 
     wide_rec = wide_df[(wide_df["ev"] >= 1.25) & (wide_df["prob"] >= 0.15)].head(3) if not wide_df.empty else pd.DataFrame()
@@ -235,6 +236,13 @@ def predict_race(
     print("\n" + "=" * 65)
     print(" 🎯 【トリプルAI × シミュレーション 厳選推奨買い目（資金傾斜付き）】")
     print("=" * 65)
+    if not win_candidate.empty:
+        for _, row in win_candidate.iterrows():
+            print(
+                f" 🟠 単勝穴狙い: [{row['horse_num']}番] {row['horse_name']} "
+                f"(単勝: {row['odds']:.1f}倍, シミュ勝率: {row['sim_win_prob']*100:.1f}%, 総合複勝率: {row['ensemble_place_prob']*100:.1f}%)"
+            )
+
     if not place_rec.empty:
         for _, row in place_rec.iterrows():
             print(
@@ -244,13 +252,6 @@ def predict_race(
             )
     else:
         print(" ⏸️ 複勝: 基準を満たす馬がいないため【見送り (KEN)】")
-
-    if not win_candidate.empty:
-        for _, row in win_candidate.iterrows():
-            print(
-                f" 🟠 単勝穴狙い: [{row['horse_num']}番] {row['horse_name']} "
-                f"(単勝: {row['odds']:.1f}倍, シミュ勝率: {row['sim_win_prob']*100:.1f}%, 総合複勝率: {row['ensemble_place_prob']*100:.1f}%)"
-            )
 
     if not wide_rec.empty:
         print("-" * 65)

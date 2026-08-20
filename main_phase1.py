@@ -39,8 +39,8 @@ def main() -> None:
         scraper = RaceScraper(config.crawler)
 
         # 3. 取得対象期間の設定
-        start_date = "20260101"
-        end_date = "20260819"
+        start_date = "20220101"
+        end_date = "20221231"
 
         all_race_ids = []
         logger.info(f"期間内のレースIDを検索します: {start_date} ~ {end_date}")
