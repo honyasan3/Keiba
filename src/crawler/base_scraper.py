@@ -76,8 +76,8 @@ class BaseScraper:
                 response = self.session.get(url, timeout=10)
                 response.raise_for_status()
 
-                # EUC-JPでデコード
-                response.encoding = "euc-jp"
+                # db.netkeiba.com(EUC-JP)とrace.netkeiba.com(UTF-8)でエンコーディングが異なるため自動判定する
+                response.encoding = response.apparent_encoding
                 return response.text
             except requests.RequestException as e:
                 retries += 1

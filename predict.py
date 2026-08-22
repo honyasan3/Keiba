@@ -18,7 +18,7 @@ from src.models.lgbm_model import LGBMRacePredictor
 from src.models.ranker_model import LGBMRankPredictor
 from src.notification.discord_notifier import DiscordNotifier
 from src.pipeline.cleaner import DataCleaner
-from src.pipeline.repository import RaceModel, RaceResultModel
+from src.pipeline.repository import PredictionRepository, RaceModel, RaceResultModel
 from src.simulation.race_simulator import MonteCarloRaceSimulator
 
 logger = setup_logger("predict")
@@ -70,6 +70,7 @@ def predict_race(
 
     config = ConfigLoader.load_config("config/settings.yaml")
     db_connector = DatabaseConnector(config.db.connection_string)
+    db_connector.create_tables()
 
     scraper = RaceScraper(config.crawler)
     try:
@@ -79,7 +80,18 @@ def predict_race(
         logger.error(f"出馬表の取得に失敗しました: {e}")
         return
 
+    # オッズは出馬表HTMLに静的に埋め込まれておらず、別APIから取得する必要がある。
+    # JRAはレース直前までオッズを公表しないため、未公表の場合は空dictが返る。
+    live_odds = scraper.fetch_live_odds(race_id)
+    odds_published = bool(live_odds)
+    if not odds_published:
+        logger.warning(
+            f"オッズが未公表のため、本レースの買い目判定（EV・ケリー推奨額）は行いません "
+            f"(Race ID: {race_id})。発走が近づいてから再実行してください。"
+        )
+
     cleaned_entries = []
+    weight_missing_count = 0
     for item in raw_card.get("entries", []):
         gender, age = None, None
         sex_age = item.get("sex_age_raw", "")
@@ -95,6 +107,11 @@ def predict_race(
             hw = int(hw_m.group(1))
             if hw_m.group(2):
                 hw_diff = int(hw_m.group(2))
+        else:
+            weight_missing_count += 1
+
+        horse_num = DataCleaner._extract_int(item.get("horse_num_raw"))
+        odds_info = live_odds.get(horse_num) if horse_num is not None else None
 
         cleaned_entries.append({
             "race_id": race_id,
@@ -107,7 +124,7 @@ def predict_race(
             "track_condition": raw_card.get("track_condition") or "良",
             "rank": None,
             "bracket_num": DataCleaner._extract_int(item.get("bracket_num_raw")),
-            "horse_num": DataCleaner._extract_int(item.get("horse_num_raw")),
+            "horse_num": horse_num,
             "horse_name": item.get("horse_name", "").strip(),
             "horse_id": item.get("horse_id", ""),
             "gender": gender,
@@ -118,8 +135,12 @@ def predict_race(
             "margin": None,
             "passage_order": None,
             "last_3f_time": None,
-            "odds": DataCleaner._extract_float(item.get("odds_raw")) or 10.0,
-            "popularity": DataCleaner._extract_int(item.get("popularity_raw")),
+            # オッズ未公表の場合はNone（架空の値で代替しない。EV計算は自然に対象外になる）
+            "odds": odds_info["odds"] if odds_info else None,
+            "popularity": odds_info["popularity"] if odds_info else None,
+            # 複勝オッズの実測レンジ（取得できない場合はNone。シミュレータ側で近似式にフォールバックする）
+            "real_place_odds_min": odds_info.get("place_odds_min") if odds_info else None,
+            "real_place_odds_max": odds_info.get("place_odds_max") if odds_info else None,
             "horse_weight": hw or 470,
             "horse_weight_diff": hw_diff or 0,
         })
@@ -128,6 +149,19 @@ def predict_race(
     if target_df.empty:
         logger.error("出走馬データが抽出できませんでした。")
         return
+
+    if weight_missing_count > 0:
+        logger.warning(
+            f"馬体重が未発表の馬が{weight_missing_count}/{len(target_df)}頭います "
+            f"(Race ID: {race_id})。JRAは通常発走1時間前に発表するため、それまでは仮値(470kg・増減0)で"
+            f"補完されており、AI予測の精度がわずかに低下する可能性があります。発表後の再実行を推奨します。"
+        )
+
+    # 枠番は出馬表HTMLから取得できず全行Noneになるため、Noneのままだと列がobject型になり
+    # concat時に既存データ(int/float)と型が衝突してLightGBM等が受け付けなくなる。
+    # 明示的にfloat64化してNaNとして扱う（モデルはNaNを欠損として正しく処理できる）。
+    for col in ("bracket_num", "odds", "popularity", "real_place_odds_min", "real_place_odds_max"):
+        target_df[col] = pd.to_numeric(target_df[col], errors="coerce")
 
     hist_df = get_historical_data(db_connector)
     hist_df = hist_df[hist_df["race_id"] != race_id].copy()
@@ -209,58 +243,129 @@ def predict_race(
     table_view["pred_place_prob"] = (table_view["pred_place_prob"] * 100).round(1).astype(str) + "%"
     table_view["sim_win_prob"] = (table_view["sim_win_prob"] * 100).round(1).astype(str) + "%"
     table_view["ensemble_place_prob"] = (table_view["ensemble_place_prob"] * 100).round(1).astype(str) + "%"
+    table_view["odds"] = table_view["odds"].apply(lambda v: f"{v:.1f}" if pd.notnull(v) else "未定")
     table_view["place_odds_est"] = table_view["place_odds_est"].round(1)
     table_view["ev_place"] = table_view["ev_place"].round(2)
     table_view["kelly_bet_place"] = table_view["kelly_bet_place"].astype(str) + "円"
     table_view.columns = ["総合順位", "馬番", "枠", "馬名", "騎手", "単勝オッズ", "推定複勝", "AI複勝率", "シミュ勝率", "総合複勝率", "複勝EV", "ケリー推奨額"]
 
     print(tabulate(table_view, headers="keys", tablefmt="fancy_grid", showindex=False))
+    if not odds_published:
+        print("\n ⚠️  オッズ未公表のため、単勝オッズ・複勝EV・ケリー推奨額は参考値になりません。買い目判定は行いません。")
 
-    # 買い目判定（データ拡充後グリッドサーチ最適化パラメータ）
-    place_rec = result_df[
-        (result_df["ev_place"] >= 1.5)
-        & (result_df["ensemble_place_prob"] >= 0.45)
-        & (result_df["pred_rank"] <= 3)
-        & (result_df["odds"] >= 5.0)
-    ]
+    # 買い目判定（いずれもrolling_walk_forward.pyによる3fold独立検証: 各foldでモデルを再学習し、
+    # Validation期間のみで選定→一度も選定に使っていないTest期間に適用、の結果。詳細はREADME「6.1」）
+    # 複勝: 3fold中2foldが単勝オッズ3.0〜5.0倍という同じオッズ帯を独立選定（残り1foldも2〜6倍と近い）。
+    #       3fold合算326件でのプールROIは110.34%。
+    # ワイド: 3fold中2foldがEV≥1.0/複勝率≥0.3/オッズ3〜10倍という完全に同一のルールを独立選定。
+    #       3fold合算15,078件でのプールROIは120.00%と、この一連の検証の中で最も件数が多く安定した結果。
+    # 単勝: 同様の3fold検証でオッズ帯・EVしきい値ともに一貫した優位性が確認できなかった
+    # （3fold合算ROI 80.77%、選定ルールもfold間で安定しない）ため、根拠不足として無効化している。
+    # オッズ未公表の場合、odds列がNaNとなり各フィルタは自然に全滅する（架空オッズで判定しない）が、
+    # 「見送り」と「オッズ未公表」は意味が異なるため明示的に空DataFrameへ倒す。
+    if odds_published:
+        place_rec = result_df[
+            (result_df["ev_place"] >= 1.4)
+            & (result_df["ensemble_place_prob"] >= 0.45)
+            & (result_df["pred_rank"] <= 3)
+            & (result_df["odds"] >= 3.0)
+            & (result_df["odds"] <= 5.0)
+        ]
 
-    win_candidate = result_df[
-        (result_df["pred_rank"] == 1)
-        & (result_df["sim_win_prob"] >= 0.25)
-        & (result_df["odds"] >= 10.0)
-        & (result_df["ev_place"] >= 1.2)
-    ]
+        # 単勝は根拠不足のため無効化（上記コメント参照）
+        win_candidate = result_df.iloc[0:0]
 
-    wide_rec = wide_df[(wide_df["ev"] >= 1.25) & (wide_df["prob"] >= 0.15)].head(3) if not wide_df.empty else pd.DataFrame()
+        wide_rec = wide_df[
+            (wide_df["ev"] >= 1.0)
+            & (wide_df["prob"] >= 0.3)
+            & (wide_df["est_odds"] >= 3.0)
+            & (wide_df["est_odds"] <= 10.0)
+        ].head(3) if not wide_df.empty else pd.DataFrame()
+    else:
+        place_rec = result_df.iloc[0:0]
+        win_candidate = result_df.iloc[0:0]
+        wide_rec = pd.DataFrame()
 
     print("\n" + "=" * 65)
     print(" 🎯 【トリプルAI × シミュレーション 厳選推奨買い目（資金傾斜付き）】")
     print("=" * 65)
-    if not win_candidate.empty:
+    if not odds_published:
+        print(" ⏸️ オッズ未公表のため買い目判定は保留です。発走が近づいてから再実行してください。")
+    elif not win_candidate.empty:
         for _, row in win_candidate.iterrows():
             print(
                 f" 🟠 単勝穴狙い: [{row['horse_num']}番] {row['horse_name']} "
                 f"(単勝: {row['odds']:.1f}倍, シミュ勝率: {row['sim_win_prob']*100:.1f}%, 総合複勝率: {row['ensemble_place_prob']*100:.1f}%)"
             )
 
-    if not place_rec.empty:
-        for _, row in place_rec.iterrows():
-            print(
-                f" 🟢 複勝推奨: [{row['horse_num']}番] {row['horse_name']} "
-                f"(総合複勝率: {row['ensemble_place_prob']*100:.1f}%, 想定: {row['place_odds_est']:.1f}倍, EV: {row['ev_place']:.2f}) "
-                f"👉 推奨賭け金: 【{row['kelly_bet_place']}円】"
-            )
-    else:
-        print(" ⏸️ 複勝: 基準を満たす馬がいないため【見送り (KEN)】")
+    if odds_published:
+        if not place_rec.empty:
+            for _, row in place_rec.iterrows():
+                print(
+                    f" 🟢 複勝推奨: [{row['horse_num']}番] {row['horse_name']} "
+                    f"(総合複勝率: {row['ensemble_place_prob']*100:.1f}%, 想定: {row['place_odds_est']:.1f}倍, EV: {row['ev_place']:.2f}) "
+                    f"👉 推奨賭け金: 【{row['kelly_bet_place']}円】"
+                )
+        else:
+            print(" ⏸️ 複勝: 基準を満たす馬がいないため【見送り (KEN)】")
 
-    if not wide_rec.empty:
+    if odds_published:
         print("-" * 65)
-        for _, row in wide_rec.iterrows():
-            print(
-                f" 🔵 ワイド推奨: [{row['pair']}] {row['names']} "
-                f"(的中率: {row['prob']*100:.1f}%, 想定: {row['est_odds']}倍, EV: {row['ev']:.2f})"
-            )
+        if not wide_rec.empty:
+            for _, row in wide_rec.iterrows():
+                print(
+                    f" 🔵 ワイド推奨: [{row['pair']}] {row['names']} "
+                    f"(的中率: {row['prob']*100:.1f}%, 想定: {row['est_odds']}倍, EV: {row['ev']:.2f})"
+                )
+        else:
+            print(" ⏸️ ワイド: 基準を満たす組み合わせがないため【見送り (KEN)】")
     print("=" * 65 + "\n")
+
+    # 買い目記録（実運用の的中率・回収率トラックレコードを残すため、通知有無に関わらず必ず保存する）
+    predicted_at = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+    prediction_records = []
+    for _, row in place_rec.iterrows():
+        prediction_records.append({
+            "bet_type": "place",
+            "horse_num": row["horse_num"],
+            "horse_name": row["horse_name"],
+            "odds_at_predict": row["odds"],
+            "pred_prob": row["ensemble_place_prob"],
+            "ev": row["ev_place"],
+            "bet_amount": int(row["kelly_bet_place"]) if row["kelly_bet_place"] else 100,
+            "predicted_at": predicted_at,
+        })
+    for _, row in win_candidate.iterrows():
+        prediction_records.append({
+            "bet_type": "win",
+            "horse_num": row["horse_num"],
+            "horse_name": row["horse_name"],
+            "odds_at_predict": row["odds"],
+            "pred_prob": row["sim_win_prob"],
+            "ev": row["ev_place"],
+            "bet_amount": 100,
+            "predicted_at": predicted_at,
+        })
+    for _, row in wide_rec.iterrows():
+        prediction_records.append({
+            "bet_type": "wide",
+            "horse_num": row["pair"],
+            "horse_name": row["names"],
+            "odds_at_predict": row["est_odds"],
+            "pred_prob": row["prob"],
+            "ev": row["ev"],
+            "bet_amount": 100,
+            "predicted_at": predicted_at,
+        })
+
+    if prediction_records:
+        with db_connector.get_session() as session:
+            PredictionRepository(session).save_predictions(
+                race_id=race_id,
+                race_title=raw_card.get("race_title"),
+                race_date=raw_card.get("race_date") or pd.Timestamp.now().strftime("%Y-%m-%d"),
+                records=prediction_records,
+            )
 
     # Discord通知
     if notify:

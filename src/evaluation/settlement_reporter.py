@@ -18,11 +18,11 @@ class SettlementReporter:
         }
 
     def fetch_race_payouts(self, race_id: str) -> Dict[str, Any]:
-        """netkeibaのレース結果HTMLから確定着順と払戻金（単勝・複勝）を取得"""
+        """netkeibaのレース結果HTMLから確定着順と払戻金（単勝・複勝・ワイド）を取得"""
         url = f"https://race.netkeiba.com/race/result.html?race_id={race_id}"
         try:
             res = requests.get(url, headers=self.headers, timeout=10)
-            res.encoding = "EUC-JP"
+            res.encoding = "utf-8"
             soup = BeautifulSoup(res.text, "html.parser")
 
             # 確定着順 (1〜3着の馬番)
@@ -39,7 +39,7 @@ class SettlementReporter:
                             pass
 
             # 払戻金テーブル解析
-            payouts = {"win": {}, "place": {}}
+            payouts = {"win": {}, "place": {}, "wide": {}}
             payout_tables = soup.find_all("table", class_="Payout_Detail_Table")
             for table in payout_tables:
                 for row in table.find_all("tr"):
@@ -51,19 +51,28 @@ class SettlementReporter:
                     if not cells:
                         continue
 
-                    # 単勝
+                    # 単勝（複数頭分の払戻が<br>区切りで1セルに入っているため、空白区切りでテキスト化してから分割する）
                     if "単勝" in htext:
-                        horse_nums = [int(x) for x in cells[0].get_text(strip=True).split() if x.isdigit()]
-                        pays = [int(x.replace(",", "")) for x in cells[1].get_text(strip=True).split() if x.replace(",", "").isdigit()]
+                        horse_nums = [int(x) for x in cells[0].get_text(" ", strip=True).split() if x.isdigit()]
+                        pays = [int(x.replace(",", "").replace("円", "")) for x in cells[1].get_text(" ", strip=True).split() if x.replace(",", "").replace("円", "").isdigit()]
                         for h, p in zip(horse_nums, pays):
                             payouts["win"][h] = p
 
                     # 複勝
                     elif "複勝" in htext:
-                        horse_nums = [int(x) for x in cells[0].get_text(strip=True).split() if x.isdigit()]
-                        pays = [int(x.replace(",", "")) for x in cells[1].get_text(strip=True).split() if x.replace(",", "").isdigit()]
+                        horse_nums = [int(x) for x in cells[0].get_text(" ", strip=True).split() if x.isdigit()]
+                        pays = [int(x.replace(",", "").replace("円", "")) for x in cells[1].get_text(" ", strip=True).split() if x.replace(",", "").replace("円", "").isdigit()]
                         for h, p in zip(horse_nums, pays):
                             payouts["place"][h] = p
+
+                    # ワイド（的中3組の馬番が2頭ずつ計6個連続で入っている: "3 10 10 14 3 14" → (3,10),(10,14),(3,14)）
+                    elif "ワイド" in htext:
+                        nums = [x for x in cells[0].get_text(" ", strip=True).split() if x.isdigit()]
+                        pays = [int(x.replace(",", "").replace("円", "")) for x in cells[1].get_text(" ", strip=True).split() if x.replace(",", "").replace("円", "").isdigit()]
+                        pairs = list(zip(nums[0::2], nums[1::2]))
+                        for (h1, h2), p in zip(pairs, pays):
+                            key = f"{min(int(h1), int(h2))}-{max(int(h1), int(h2))}"
+                            payouts["wide"][key] = p
 
             return {
                 "race_id": race_id,
@@ -72,7 +81,7 @@ class SettlementReporter:
             }
         except Exception as e:
             logger.error(f"払戻金データの取得に失敗しました (Race ID: {race_id}): {e}")
-            return {"race_id": race_id, "top3": [], "payouts": {"win": {}, "place": {}}}
+            return {"race_id": race_id, "top3": [], "payouts": {"win": {}, "place": {}, "wide": {}}}
 
     def calculate_settlement(
         self,
@@ -105,24 +114,37 @@ class SettlementReporter:
             is_hit = False
             payout_amount = 0
 
-            if btype == "place" and hnum in res["payouts"]["place"]:
+            if btype == "place" and int(hnum) in res["payouts"]["place"]:
                 # 複勝払戻金（100円あたりの払戻金額）
-                unit_pay = res["payouts"]["place"][hnum]
+                unit_pay = res["payouts"]["place"][int(hnum)]
                 payout_amount = int(invest * (unit_pay / 100))
                 is_hit = True
-            elif btype == "win" and hnum in res["payouts"]["win"]:
-                unit_pay = res["payouts"]["win"][hnum]
+            elif btype == "win" and int(hnum) in res["payouts"]["win"]:
+                unit_pay = res["payouts"]["win"][int(hnum)]
                 payout_amount = int(invest * (unit_pay / 100))
                 is_hit = True
+            elif btype == "wide":
+                # horse_numは"5-10"のようなペア表記。払戻辞書のキー（min-max順）に正規化して照合する
+                try:
+                    a, b = str(hnum).split("-")
+                    wide_key = f"{min(int(a), int(b))}-{max(int(a), int(b))}"
+                except ValueError:
+                    wide_key = None
+                if wide_key and wide_key in res["payouts"]["wide"]:
+                    unit_pay = res["payouts"]["wide"][wide_key]
+                    payout_amount = int(invest * (unit_pay / 100))
+                    is_hit = True
 
             if is_hit:
                 hit_count += 1
                 total_return += payout_amount
 
+            bet_type_label = {"place": "複勝", "win": "単勝", "wide": "ワイド"}.get(btype, btype)
+            horse_label = f"[{hnum}]" if btype == "wide" else f"[{hnum}番]"
             details.append({
                 "race_title": bet.get("race_title", rid),
-                "bet_type": "複勝" if btype == "place" else "単勝",
-                "horse": f"[{hnum}番] {bet.get('horse_name', '')}",
+                "bet_type": bet_type_label,
+                "horse": f"{horse_label} {bet.get('horse_name', '')}",
                 "invest": invest,
                 "payout": payout_amount,
                 "is_hit": is_hit,

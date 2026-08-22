@@ -83,7 +83,13 @@ class MonteCarloRaceSimulator:
             bet = int(bankroll * f_star * kelly_fraction / 100) * 100
             return max(bet, 0)
 
-        horses["place_odds_est"] = (horses["odds"].fillna(1.0) ** 0.45).clip(lower=1.1)
+        # 複勝オッズは、オッズAPIの実測レンジ(real_place_odds_min/max)が入力DataFrameにあれば
+        # それを優先する（保守的に見て下限値を採用）。無ければ単勝オッズからの近似式にフォールバックする。
+        approx_odds_est = (horses["odds"].fillna(1.0) ** 0.45).clip(lower=1.1)
+        if "real_place_odds_min" in horses.columns:
+            horses["place_odds_est"] = horses["real_place_odds_min"].fillna(approx_odds_est)
+        else:
+            horses["place_odds_est"] = approx_odds_est
         horses["ev_place"] = horses["ensemble_place_prob"] * horses["place_odds_est"]
         horses["kelly_bet_place"] = horses.apply(calc_kelly_bet, axis=1)
 

@@ -1,5 +1,14 @@
-"""ベッティング戦略最適化スクリプト（全46特徴量: トラックバイアス & Elo & トリプルアンサンブル統合版）"""
-import os
+"""ベッティング戦略最適化スクリプト（全46特徴量: トラックバイアス & Elo & トリプルアンサンブル統合版）
+
+【walk-forward検証】
+以前の実装は、グリッドサーチによる戦略選定と、その戦略の性能評価を同一のテスト期間データに対して
+行っており、報告されるROIが選定に使ったデータへの評価という点で厳密なout-of-sampleになっていなかった
+（このスクリプトのグリッドサーチ結果を backtest_simulation.py がそのまま同じテスト期間に対して
+再評価していたため、事実上「一番儲かるルールを探して、それを同じデータで採点する」形になっていた）。
+
+本スクリプトでは、閾値の選定を Validation 期間のみで行い、選ばれた戦略を一度も選定に使っていない
+Test 期間に適用して初めて成績を報告する、時系列を跨いだ walk-forward 検証に改めている。
+"""
 import pandas as pd
 from tabulate import tabulate
 
@@ -7,13 +16,11 @@ from config.config_loader import ConfigLoader
 from src.common.db import DatabaseConnector
 from src.common.logger import setup_logger
 from src.dataset.time_splitter import TimeSeriesDataSplitter
+from src.evaluation.ensemble_runner import run_ensemble_inference
 from src.evaluation.strategy_optimizer import BettingStrategyOptimizer
 from src.features.horse_features import PastPerformanceExtractor
 from src.features.race_features import RaceFeatureExtractor
 from src.features.track_bias_features import TrackBiasFeatureExtractor
-from src.models.catboost_model import CatBoostRacePredictor
-from src.models.lgbm_model import LGBMRacePredictor
-from src.models.ranker_model import LGBMRankPredictor
 from src.pipeline.repository import RaceModel, RaceResultModel
 
 logger = setup_logger("optimize_betting")
@@ -55,7 +62,7 @@ def get_all_race_data(db_connector: DatabaseConnector) -> pd.DataFrame:
 
 
 def run_optimization() -> None:
-    logger.info("=== 買い目戦略最適化グリッドサーチ（トリプルアンサンブル & 46特徴量版）を開始します ===")
+    logger.info("=== 買い目戦略 walk-forward 最適化（トリプルアンサンブル & 46特徴量版）を開始します ===")
     config = ConfigLoader.load_config("config/settings.yaml")
     db_connector = DatabaseConnector(config.db.connection_string)
 
@@ -82,82 +89,68 @@ def run_optimization() -> None:
     val_end = unique_dates[val_idx]
 
     splitter = TimeSeriesDataSplitter()
-    _, _, test_df = splitter.split_by_date(
+    _, val_df, test_df = splitter.split_by_date(
         featured_df, train_end=train_end, val_end=val_end
     )
+    val_df = val_df.copy().reset_index(drop=True)
     test_df = test_df.copy().reset_index(drop=True)
 
-    logger.info(f"評価データ期間: {test_df['race_date'].min()} ~ {test_df['race_date'].max()} のテストデータを対象に検証します")
+    logger.info(f"Validation期間: {val_df['race_date'].min()} ~ {val_df['race_date'].max()}（戦略選定用）")
+    logger.info(f"Test期間: {test_df['race_date'].min()} ~ {test_df['race_date'].max()}（out-of-sample評価用、選定には一切使用しない）")
 
-    # 全46特徴量リスト
-    feature_cols = [
-        "venue_code", "race_round", "distance", "course_type_cat", "weather_cat",
-        "track_condition_cat", "bracket_num", "horse_num", "gender_cat", "age", "age_gender_cat",
-        "jockey_weight", "jockey_weight_diff_from_race_mean", "race_horse_count",
-        "horse_weight", "horse_weight_diff", "horse_weight_diff_rate",
-        "horse_past_runs", "horse_past_avg_rank", "horse_past_win_rate", "horse_past_place_rate",
-        "horse_avg_passage_rate", "distance_diff", "distance_shock_cat", "horse_recent3_avg_rank",
-        "horse_recent3_avg_last3f", "horse_recent3_avg_speed_index", "days_since_prev_race",
-        "rest_category_cat", "is_second_run_after_rest", "is_jockey_changed",
-        "jockey_past_win_rate", "jockey_past_place_rate", "jockey_venue_place_rate",
-        "course_bracket_place_rate", "race_front_runner_count",
-        # 展開負荷・ラップペース特徴量
-        "horse_recent3_avg_pci", "prev_pace_disadvantage_front", "prev_pace_disadvantage_back",
-        "race_expected_pace_cat", "pace_match_score",
-        # Eloレーティング特徴量
-        "horse_elo_rating", "race_elo_diff_from_mean",
-        # 当日トラックバイアス特徴量
-        "bias_inner_bracket_advantage", "bias_front_runner_advantage", "bias_horse_match_score"
-    ]
+    # 3. トリプルアンサンブル推論（Val/Testそれぞれ独立に実行）
+    val_df = run_ensemble_inference(val_df)
+    test_df = run_ensemble_inference(test_df)
 
-    # 3. トリプルアンサンブルモデル読み込みと推論 (LGBM 40% + CatBoost 40% + Ranker 20%)
-    lgbm_predictor = LGBMRacePredictor()
-    lgbm_predictor.load("models_saved/lgbm_model.txt")
-    lgbm_probs = lgbm_predictor.predict_proba(test_df[feature_cols])
-
-    if os.path.exists("models_saved/catboost_model.cbm"):
-        cb_predictor = CatBoostRacePredictor()
-        cb_predictor.load("models_saved/catboost_model.cbm")
-        cb_probs = cb_predictor.predict_proba(test_df[feature_cols])
-    else:
-        cb_probs = lgbm_probs
-
-    if os.path.exists("models_saved/lambdarank_model.txt"):
-        rank_predictor = LGBMRankPredictor()
-        rank_predictor.load("models_saved/lambdarank_model.txt")
-        rank_scores = rank_predictor.predict_score(test_df)
-        test_df["_rank_score"] = rank_scores
-        rank_norm_scores = test_df.groupby("race_id")["_rank_score"].rank(pct=True).values
-    else:
-        rank_norm_scores = lgbm_probs
-
-    test_df["pred_place_prob"] = (lgbm_probs * 0.40) + (cb_probs * 0.40) + (rank_norm_scores * 0.20)
-
-    # レースごとの予測順位 (pred_rank) を算出
-    test_df["pred_rank"] = (
-        test_df.groupby("race_id")["pred_place_prob"]
-        .rank(ascending=False, method="min")
-        .astype(int)
-    )
-
-    # 4. グリッドサーチ最適化
     optimizer = BettingStrategyOptimizer()
 
-    logger.info("=== 複勝ベッティングルールの最適化中 ===")
-    place_results = optimizer.optimize_place_strategy(test_df)
-    print("\n【複勝 最適戦略 Top 5】")
-    if not place_results.empty:
-        print(tabulate(place_results.head(5), headers="keys", tablefmt="github", showindex=False))
+    # === 複勝戦略 ===
+    logger.info("=== 複勝ベッティングルールの最適化中（Validation期間のみを使用） ===")
+    place_val_results = optimizer.optimize_place_strategy(val_df)
+    print("\n【複勝 最適戦略 Top 5（Validation期間で選定）】")
+    if not place_val_results.empty:
+        print(tabulate(place_val_results.head(5), headers="keys", tablefmt="github", showindex=False))
+
+        best_place = place_val_results.iloc[0]
+        test_place_eval = BettingStrategyOptimizer.prep_place_eval_df(test_df)
+        place_test_result = BettingStrategyOptimizer.evaluate_place_strategy(
+            test_place_eval,
+            ev_th=best_place["ev_threshold"],
+            min_p=best_place["min_prob"],
+            max_r=int(best_place["max_rank"]),
+            odds_range=(best_place["min_odds"], best_place["max_odds"]),
+        )
+        print("\n【複勝 Validation選定ルールをTest期間に適用した結果（out-of-sample）】")
+        print(tabulate([place_test_result], headers="keys", tablefmt="github", showindex=False))
     else:
         print("条件を満たす戦略が見つかりませんでした。")
 
-    logger.info("=== 単勝ベッティングルールの最適化中 ===")
-    win_results = optimizer.optimize_win_strategy(test_df)
-    print("\n【単勝 最適戦略 Top 5】")
-    if not win_results.empty:
-        print(tabulate(win_results.head(5), headers="keys", tablefmt="github", showindex=False))
+    # === 単勝戦略 ===
+    logger.info("=== 単勝ベッティングルールの最適化中（Validation期間のみを使用） ===")
+    win_val_results = optimizer.optimize_win_strategy(val_df)
+    print("\n【単勝 最適戦略 Top 5（Validation期間で選定）】")
+    if not win_val_results.empty:
+        print(tabulate(win_val_results.head(5), headers="keys", tablefmt="github", showindex=False))
+
+        best_win = win_val_results.iloc[0]
+        test_win_eval = BettingStrategyOptimizer.prep_win_eval_df(test_df)
+        win_test_result = BettingStrategyOptimizer.evaluate_win_strategy(
+            test_win_eval,
+            ev_th=best_win["ev_threshold"],
+            min_p=best_win["min_prob"],
+            max_r=int(best_win["max_rank"]),
+            odds_range=(best_win["min_odds"], best_win["max_odds"]),
+        )
+        print("\n【単勝 Validation選定ルールをTest期間に適用した結果（out-of-sample）】")
+        print(tabulate([win_test_result], headers="keys", tablefmt="github", showindex=False))
     else:
         print("条件を満たす戦略が見つかりませんでした。")
+
+    print(
+        "\n※ 上記「Validation選定ルールをTest期間に適用した結果」が、閾値選定に使っていない"
+        "データに対する唯一の公正な回収率評価です。Validation期間のTop5表はあくまで選定過程の参考値であり、"
+        "そのROIをそのまま実運用の期待値として扱わないでください。"
+    )
 
 
 if __name__ == "__main__":
